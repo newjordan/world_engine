@@ -77,8 +77,8 @@ frame_idx % dilation == 0`). Those 16 keyframes span `16 × 8 = 128` latent fram
 The horizon equals `global_window` latent frames = 128.
 
 Verified empirically by tracing the real `LayerKVCache` on CPU (feed frames
-`0…399`, read back which frame indices survive in the ring) —
-`scratchpad/kv_horizon_probe.py`:
+`0…399`, read back which frame indices survive in the ring) — locked as a regression
+test, `examples/test_kv_pinning.py::test_effective_horizons_match_config`:
 
 - global (window=128, dilation=8): 16 frames retained, spacing 8, oldest = 127 back → **horizon 128** ✓
 - local (window=16, dilation=1): 16 frames retained, spacing 1, oldest = 15 back → **horizon 16** ✓
@@ -193,9 +193,11 @@ and loses the *detail*, the signature of ring-buffer eviction.
   horizon). The **forgetting-specific** signal is the *growth* of the gap with K.
 - *Metrics*: PSNR punishes sub-pixel view offsets; SSIM + the contact sheets guard the
   interpretation. LPIPS optional (not installed here).
-- *Oracle*: the oracle numbers in `bench_out/sweep` are **contaminated** — they were
-  produced before the `get_state`/`load_state` VAE-state fix (see below), so they drift
-  with K instead of being a flat floor. A clean oracle re-run replaces them below.
+- *Oracle*: the oracle floor (perfect memory) is **38.2 dB / 0.97 SSIM, flat across all
+  K** (`bench_out/oracle_fixed`, produced with the VAE-state fix below). Because it does
+  not decline with K, the revisit collapse is **genuine forgetting, not sampling noise**
+  — revisit falls from the 38 dB perfect-memory ceiling to 25→12 dB. (The oracle in the
+  original `bench_out/sweep` run drifts with K — it predates the fix — and is superseded.)
 - Single model / single checkpoint.
 
 ### Engine fix surfaced by the oracle arm
@@ -203,9 +205,12 @@ and loses the *detail*, the signature of ring-buffer eviction.
 The oracle arm exposed a real bug: `WorldEngine.get_state()` claimed to capture the
 world state but omitted the **TAEHV streaming decoder/encoder temporal buffers**, so
 `load_state` left them at their post-excursion values — a restored state kept decoding
-frames from the pre-snapshot stream. Fixed in `src/ae.py` + `src/world_engine.py`
+frames from the pre-snapshot stream. That made the pre-fix oracle *decline* with K
+(32.5 → 26.1 dB) instead of holding flat. Fixed in `src/ae.py` + `src/world_engine.py`
 (deep-clone of the 7 `StreamingTAEHV.reset()` state fields; backward-compatible with
-older snapshots). Regression tests in `examples/test_ae_state.py`.
+older snapshots); regression tests in `examples/test_ae_state.py`. **After the fix the
+oracle is flat at 38.2 dB ± 1.4 across K = 8…256** — confirming the omission was the
+whole contamination.
 
 ## Phase 3 — KV frame-pinning (inference-side mitigation)
 

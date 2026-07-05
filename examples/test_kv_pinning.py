@@ -148,6 +148,27 @@ def test_pin0_is_noop():
     assert torch.equal(before, c.kv)
 
 
+def test_effective_horizons_match_config():
+    """Lock the Phase-1 correction: dilation sets spacing, not horizon length. The
+    global layer (window=128, dilation=8) retains 16 keyframes spaced 8 apart -> a
+    128-frame horizon (NOT global_window*dilation=1024). Local (window=16) -> 16."""
+    for window, dil, exp_retained, exp_spacing, exp_oldest in [
+        (128, 8, 16, 8, 127),   # global (real Waypoint-1.5 ratio)
+        (16, 1, 16, 1, 15),     # local
+        (128, 1, 128, 1, 127),  # dense control
+    ]:
+        c = make_layer(window=window, dilation=dil)
+        for f in range(400):
+            feed(c, f, f + 1.0)
+        L = window * TPF
+        vals = c.kv[0, 0, 0, :L, 0]
+        retained = sorted(set((vals[c.written[:L]] - 1).long().tolist()))
+        assert len(retained) == exp_retained, (window, dil, len(retained))
+        assert 399 - retained[0] == exp_oldest
+        if len(retained) > 1:
+            assert {b - a for a, b in zip(retained, retained[1:])} == {exp_spacing}
+
+
 # --------------------------------------------------------------------------- #
 # StaticKVCache: global-only pinning by default
 # --------------------------------------------------------------------------- #
