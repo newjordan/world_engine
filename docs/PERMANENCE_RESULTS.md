@@ -6,6 +6,32 @@
 
 ---
 
+## TL;DR
+
+1. **Waypoint-1.5 forgets scenes it panned away from.** Revisiting a view after a
+   camera excursion costs **7–10 dB PSNR / 0.18–0.34 SSIM** vs. holding the camera
+   still — ~5× the sampling floor, robust across 3 scenes × 5 seeds. It keeps the gist
+   and hallucinates the detail. *(Phase 2)*
+2. **The cause is the KV ring buffer, baked into the weights.** Forgetting tracks the
+   cache horizons: a knee at the **16-frame local horizon** (18/24 layers) and a
+   **128-frame global horizon** (6 dilated layers). The plan's global horizon estimate
+   was 8× too high — corrected here. *(Phase 1)*
+3. **Inference-side frame-pinning does not help.** Re-inserting the evicted frame's
+   keys so they survive and stay attendable moves revisit quality by **≤ 0.17 dB /
+   0.007 SSIM (nothing)** — the pretrained attention can't use keys at out-of-
+   distribution RoPE positions. *(Phase 3)*
+4. **⇒ Permanence must be trained in, not patched at inference.** The forgetting curve
+   and the null pinning result are the evidence base for a training-side proposal
+   (persistent keyframes / learned scene memory). *(Phase 4)*
+
+Bonus: the benchmark's oracle arm surfaced a real bug — `engine.get_state`/`load_state`
+silently omitted the TAEHV streaming-decoder state; fixed + tested.
+
+All numbers trace to `bench_out/*/results.csv`; every stage is flag-gated and
+default-off. Reproduce via `examples/permanence_bench.py` (see file header).
+
+---
+
 ## Phase 1 — Memory horizons (config-derived + empirically verified)
 
 Config: `Overworld/Waypoint-1.5-1B` (`config.yaml`, loaded without weights).
@@ -181,10 +207,88 @@ frames from the pre-snapshot stream. Fixed in `src/ae.py` + `src/world_engine.py
 (deep-clone of the 7 `StreamingTAEHV.reset()` state fields; backward-compatible with
 older snapshots). Regression tests in `examples/test_ae_state.py`.
 
-## Phase 3 — KV frame-pinning
+## Phase 3 — KV frame-pinning (inference-side mitigation)
 
-_(pending)_
+**Design.** `LayerKVCache` gains optional dedicated pin slots — layout
+`[ring | pins | tail]` — written only by an explicit `pin_current()` and exempt from
+ring eviction. `WorldEngine.pin_frame()` copies the current frame's **post-RoPE** KV
+(variant (a): keys keep their original absolute temporal phase) into pin slots on the
+**global layers only** (where long-horizon attention was trained). Flag-gated via
+`model_config_overrides={"n_pin_frames": N}`; `N=0` (default) is the exact original
+cache. The Phase-2 harness pins view A right after settle (`--pin-at-reference`).
 
-## Phase 4 — Pitch
+**Sanity gates (full model).**
+- *Determinism* — P=0 vs P=0 rerun: `max|Δlatent| = 0`, `max|ΔRGB| = 0` (bit-identical;
+  cudagraphs are deterministic → the whole benchmark is reproducible).
+- *Inertness* — P=0 vs `n_pin_frames=4` with no `pin_frame()`: `max|Δlatent| = 4.1e-2`.
+  Not bit-identical, but this is **kernel-autotune noise from the larger KV buffer**
+  (global capacity 66048 → 68096 selects a different flex_attention kernel), *not* a
+  masking error: the CPU test proves P=4-no-pin has bit-identical *attended* KV + block
+  mask to P=0 (`examples/test_kv_pinning.py::test_unpinned_output_matches_baseline`), so
+  on identical inputs the residual is pure bf16 kernel rounding. Negligible vs the
+  7–10 dB forgetting effect.
+- *Mechanism verified* — on the real model, `pin_frame()` writes the reference frame's
+  KV into the global-layer pin slots (`written` 0 → 512, `pin0 == tail`), it **survives
+  a 64-frame excursion unchanged** (persists past ring eviction), and the no-pin control
+  keeps the pin region empty. So pinned keys are genuinely present and attendable.
 
-_(pending)_
+**Result — pinning is a no-op.** `revisit+pin` tracks `revisit` to within seed noise at
+every K:
+
+| K | revisit PSNR | revisit+pin PSNR | **pin − revisit** | revisit SSIM | pin SSIM | **Δ** |
+|---|---|---|---|---|---|---|
+| 8 | 25.48 | 25.59 | +0.12 | 0.776 | 0.783 | +0.007 |
+| 16 | 22.72 | 22.60 | −0.12 | 0.718 | 0.714 | −0.004 |
+| 32 | 18.76 | 18.79 | +0.02 | 0.615 | 0.619 | +0.004 |
+| 64 | 16.21 | 16.07 | −0.14 | 0.577 | 0.578 | +0.002 |
+| 128 | 14.84 | 14.73 | −0.11 | 0.554 | 0.556 | +0.002 |
+| 256 | 12.66 | 12.49 | −0.17 | 0.493 | 0.493 | +0.000 |
+
+![baseline vs pinned](./permanence_assets/combined_baseline_vs_pinned.png)
+
+The pinned-revisit curve lies **exactly on top of** baseline revisit.
+
+**Interpretation.** The pinned keys survive eviction and are attended — but the
+pretrained model does not *use* them. The most likely cause is the RoPE constraint
+(`src/model/attn.py:108`): keys are cached **post-RoPE** carrying the absolute temporal
+phase of their original `t_pos`. When queried K frames later, the query–key relative
+distance far exceeds the trained global horizon (128 latent frames) — a temporal
+position the attention never learned to score, so the pinned key's QK logit is
+effectively negligible and it contributes ~nothing. **Making a forgotten frame
+*available* is not the same as making the model *use* it.** This is the plan's
+anticipated variant-(a) failure mode, measured rather than assumed.
+
+## Phase 4 — Pitch: permanence needs a training-side fix
+
+**The one-page argument.**
+
+1. **Scenes are forgotten, measurably.** Panning away and back costs **7–10 dB PSNR /
+   0.18–0.34 SSIM** vs. a static camera (Phase 2), ~5× the sampling floor, robust across
+   3 scenes × 5 seeds. The returned view keeps the *gist* and hallucinates the *detail*.
+2. **The cause is architectural, not stochastic.** Forgetting tracks the KV ring-buffer
+   horizons exactly: the knee is at the **16-frame local horizon** (18 of 24 layers),
+   and only the 6 dilated global layers (128-frame horizon, 16 keyframes) carry anything
+   further. This layout is **baked into the pretrained weights**.
+3. **Inference-side pinning does not fix it.** Re-inserting the evicted frame's keys so
+   they survive and remain attendable changes revisit quality by **≤ 0.17 dB / 0.007
+   SSIM — nothing** (Phase 3). The weights can't leverage persistent memory they were
+   never trained to use; the post-RoPE keys sit at out-of-distribution temporal
+   distances the attention can't score.
+4. **Therefore the fix must be trained in.** The evidence says permanence is not a
+   band-aid you can bolt onto Waypoint-1.5 at inference — it is a property the
+   architecture has to learn.
+
+**Concrete asks (in increasing scope):**
+- **(b) Position re-stamping** *(inference, medium)* — cache pinned keys **pre-RoPE** and
+  re-rotate them at read time to an in-distribution relative position. This directly
+  tests whether variant (a)'s null is *only* the OOD-position problem. Bigger change
+  (touches the attention read path); the harness's `--pin-at-reference` already provides
+  the evaluation.
+- **Training with persistent keyframes** *(training repo, the big win)* — train Waypoint
+  with randomly-pinned distant keyframes / a learned scene-memory slot so the attention
+  natively learns to attend across the ring boundary. Phases 2–3 are the evidence base:
+  forgetting is large and cannot be patched post-hoc.
+
+**Reproduce:** `uv run --dev python examples/permanence_bench.py --self-test` (CPU dry
+run); full sweep + pinning via `--arms … --pin-at-reference` (see file header). Curves
+regenerate with `examples/combine_curves.py`. Pin mechanism: `examples/test_kv_pinning.py`.
