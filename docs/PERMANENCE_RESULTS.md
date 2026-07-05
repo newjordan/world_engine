@@ -212,6 +212,17 @@ older snapshots); regression tests in `examples/test_ae_state.py`. **After the f
 oracle is flat at 38.2 dB ± 1.4 across K = 8…256** — confirming the omission was the
 whole contamination.
 
+The user-visible impact is at any **snapshot → restore** boundary (rewind / branch /
+replay a world): before the fix, the first frames after `load_state` **ghosted content
+from the discarded timeline** because the streaming decoder's memory was never restored.
+Demo (`examples/demo_state_restore_ghosting.py`): snapshot a scene, run a hard-turn
+branch, restore, and decode the *identical* latent both ways — the only variable is the
+decoder memory. The buggy restore is **27.9 dB** from the snapshot target; the fixed
+restore is **38.4 dB** (clean). Straight-ahead generation is unaffected — this only
+touches the save/restore path.
+
+![state-restore ghosting before/after](./permanence_assets/state_restore_ghosting_before_after.png)
+
 ## Phase 3 — KV frame-pinning (inference-side mitigation)
 
 **Design.** `LayerKVCache` gains optional dedicated pin slots — layout
