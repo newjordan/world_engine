@@ -3,6 +3,18 @@ import torch.nn.functional as F
 from torch import Tensor
 
 
+def _clone_state(x):
+    """Deep-clone a streaming-state value (tensors, lists, namedtuples, scalars)."""
+    if isinstance(x, torch.Tensor):
+        return x.detach().clone()
+    if isinstance(x, list):
+        return [_clone_state(e) for e in x]
+    if isinstance(x, tuple):  # incl. namedtuples (TWorkItem)
+        cloned = [_clone_state(e) for e in x]
+        return type(x)(*cloned) if hasattr(x, "_fields") else tuple(cloned)
+    return x  # int / None / immutable
+
+
 class ChunkedStreamingTAEHV:
     _ENCODE_SIZES = {(720, 1280): (512, 1024), (360, 640): (256, 512)}
     _DECODE_SIZES = {v: k for k, v in _ENCODE_SIZES.items()}
@@ -42,6 +54,27 @@ class ChunkedStreamingTAEHV:
 
         # Rebuild streaming state, reuse same weights model
         self.streaming_ae_model = StreamingTAEHV(self.streaming_ae_model.taehv)
+
+    # Streaming temporal state (mirrors taehv.StreamingTAEHV.reset). Snapshotting these
+    # is required for engine.get_state/load_state to actually restore the full world
+    # state; omitting them leaks decoder frames across a load_state boundary.
+    _STREAM_ATTRS = (
+        "encoder_work_queue", "encoder_memory",
+        "decoder_work_queue", "decoder_memory",
+        "n_frames_encoded", "n_frames_decoded",
+        "_last_encoder_input_frame",
+    )
+
+    @torch.inference_mode()
+    def get_state(self):
+        m = self.streaming_ae_model
+        return {a: _clone_state(getattr(m, a)) for a in self._STREAM_ATTRS}
+
+    @torch.inference_mode()
+    def load_state(self, state):
+        m = self.streaming_ae_model
+        for a, v in state.items():
+            setattr(m, a, _clone_state(v))
 
     def _resize(self, x: Tensor, size: tuple[int, int]) -> Tensor:
         return F.interpolate(x[0], size=size, mode="bilinear", align_corners=False)[None]
@@ -101,6 +134,12 @@ class InferenceAE:
         self.ae_model = ae_model.eval().to(device=device, dtype=dtype)
 
     def reset(self):
+        pass
+
+    def get_state(self):
+        return {}  # stateless: no streaming temporal memory to snapshot
+
+    def load_state(self, state):
         pass
 
     @classmethod

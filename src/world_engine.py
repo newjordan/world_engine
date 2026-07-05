@@ -120,14 +120,23 @@ class WorldEngine:
 
     @torch.inference_mode()
     def get_state(self):
-        """Captures a world state to continue via load_state. Doesn't save model"""
-        return {"kv_cache": self.kv_cache.get_state(), "frame_ts": self.frame_ts.detach().clone()}
+        """Captures a world state to continue via load_state. Doesn't save model.
+        Includes the VAE streaming temporal state — without it, a restored state would
+        keep decoding frames from the pre-snapshot stream (e.g. an oracle/replay would
+        leak the frames generated after the snapshot)."""
+        return {
+            "kv_cache": self.kv_cache.get_state(),
+            "frame_ts": self.frame_ts.detach().clone(),
+            "vae": self.vae.get_state(),
+        }
 
     @torch.inference_mode()
     def load_state(self, state):
         """Loads a world state object saved via save_state. Doesn't load or change model"""
         self.kv_cache.load_state(state["kv_cache"])
         self.frame_ts.copy_(state["frame_ts"])
+        if "vae" in state:  # backward-compatible with snapshots taken before VAE state
+            self.vae.load_state(state["vae"])
 
     def set_prompt(self, prompt: str):
         """Apply text conditioning for T2V"""
