@@ -13,6 +13,10 @@ MODEL_CONFIG_DEFAULTS = OmegaConf.create(
         "inference_fps": "${base_fps}",
         "model_type": "waypoint-1",
         "n_kv_heads": "${n_heads}",
+        # Object/scene permanence (inference-side frame pinning). Default 0 => no pin
+        # slots => exact original KV-cache behavior. See src/model/kv_cache.py.
+        "n_pin_frames": 0,
+        "pin_all_layers": False,
         "patch": [1, 1],
         "prompt_conditioning": None,
         "prompt_encoder_uri": "google/umt5-xl",

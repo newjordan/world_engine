@@ -57,16 +57,28 @@ def make_block_mask(T: int, L: int, written: torch.Tensor) -> BlockMask:
 
 class LayerKVCache(nn.Module):
     """
-    Ring-buffer KV cache with fixed capacity L (tokens) for history plus
-    one extra frame (tokens_per_frame) at the tail holding the current frame.
+    Ring-buffer KV cache with fixed capacity L (tokens) for history plus, optionally,
+    `n_pin_frames` dedicated pin slots (object/scene permanence), plus one extra frame
+    (tokens_per_frame) at the tail holding the current frame.
+
+    Slot layout: [ ring (L) | pins (n_pin_frames*tpf) | tail (tpf) ]
+
+    Pin slots are written only by an explicit `pin_current()` call and survive ring
+    eviction, so a frame pinned there stays attendable indefinitely. With
+    n_pin_frames == 0 the layout, buffers, and behavior are identical to the original
+    ring cache (bit-for-bit), so pinning is opt-in and default-off.
     """
 
-    def __init__(self, B, H, L, Dh, dtype, tokens_per_frame: int, pinned_dilation: int = 1):
+    def __init__(self, B, H, L, Dh, dtype, tokens_per_frame: int, pinned_dilation: int = 1,
+                 n_pin_frames: int = 0):
         super().__init__()
         self.tpf = tokens_per_frame
         self.L = L
-        # total KV capacity: ring (L) + tail frame (tpf)
-        self.capacity = L + self.tpf
+        self.n_pin_frames = n_pin_frames
+        # slot regions: ring [0, L) | pins [pin_start, tail_start) | tail [tail_start, capacity)
+        self.pin_start = L
+        self.tail_start = L + n_pin_frames * self.tpf
+        self.capacity = self.tail_start + self.tpf
         self.pinned_dilation = pinned_dilation
         self.num_buckets = (L // self.tpf) // self.pinned_dilation
         assert (L // self.tpf) % pinned_dilation == 0 and L % self.tpf == 0
@@ -78,22 +90,40 @@ class LayerKVCache(nn.Module):
         )
 
         # which slots have ever been written
-        # tail slice [L, L+tpf) always holds the current frame and is considered written
+        # tail slice [tail_start, capacity) always holds the current frame -> written.
+        # ring and pin slots start empty (masked out until first written / pinned).
         written = torch.zeros(self.capacity, dtype=torch.bool)
-        written[L:] = True
+        written[self.tail_start:] = True
         self.written = nn.Buffer(written, persistent=False)
         self._mask_written = nn.Buffer(torch.empty_like(written), persistent=False)
 
         # Precompute indices:
-        #   frame_offsets: [0, 1, ..., tpf-1] (for ring indexing)
-        #   current_idx:   [L, L+1, ..., L+tpf-1] (tail slice)
+        #   frame_offsets: [0, 1, ..., tpf-1] (for ring / pin indexing)
+        #   current_idx:   tail slice [tail_start, tail_start+tpf)
         self.frame_offsets = nn.Buffer(torch.arange(self.tpf, dtype=torch.long), persistent=False)
-        self.current_idx = nn.Buffer(self.frame_offsets + L, persistent=False)
+        self.current_idx = nn.Buffer(self.frame_offsets + self.tail_start, persistent=False)
+        self._pin_slot = 0  # round-robin write pointer for pin_current()
 
     def reset(self):
         self.kv.zero_()
         self.written.zero_()
-        self.written[self.L:].fill_(True)
+        self.written[self.tail_start:].fill_(True)
+        self._pin_slot = 0
+
+    @torch.inference_mode()
+    def pin_current(self, slot: int = None):
+        """Copy the current tail frame's (post-RoPE) KV into a pin slot so it survives
+        ring eviction. No-op when n_pin_frames == 0. Runs eagerly between generation
+        steps (a plain buffer mutation with static shapes -> no recompile)."""
+        if self.n_pin_frames == 0:
+            return
+        if slot is None:
+            slot = self._pin_slot
+            self._pin_slot = (self._pin_slot + 1) % self.n_pin_frames
+        dst = self.frame_offsets + (self.pin_start + slot * self.tpf)
+        src = self.kv.index_select(3, self.current_idx)
+        self.kv.index_copy_(3, dst, src)
+        self.written[dst] = True
 
     def upsert(self, kv: Tensor, pos_ids: TensorDict, is_frozen: bool):
         """
@@ -154,15 +184,26 @@ class StaticKVCache(nn.Module):
 
         period = config.global_attn_period
         off = config.global_attn_offset % period
+
+        # Object/scene permanence: allocate pin slots on global layers by default
+        # (they carry the trained long-horizon attention); pin_all_layers extends to
+        # local layers too. n_pin_frames == 0 (default) => no pins => original behavior.
+        n_pin = int(config.get("n_pin_frames", 0))
+        pin_all = bool(config.get("pin_all_layers", False))
+
+        def is_global(layer_idx):
+            return (layer_idx - off) % period == 0
+
         self.layers = nn.ModuleList([
             LayerKVCache(
                 batch_size,
                 config.n_kv_heads,
-                global_L if ((layer_idx - off) % period == 0) else local_L,
+                global_L if is_global(layer_idx) else local_L,
                 config.d_model // config.n_heads,
                 dtype,
                 self.tpf,
-                config.global_pinned_dilation if ((layer_idx - off) % period == 0) else 1,
+                config.global_pinned_dilation if is_global(layer_idx) else 1,
+                n_pin_frames=n_pin if (is_global(layer_idx) or pin_all) else 0,
             )
             for layer_idx in range(config.n_layers)
         ])
@@ -173,6 +214,13 @@ class StaticKVCache(nn.Module):
         for layer in self.layers:
             layer.reset()
         self._is_frozen = True
+
+    @torch.inference_mode()
+    def pin_current(self):
+        """Pin the current frame in every layer that has pin slots (global layers by
+        default). Layers with n_pin_frames == 0 are no-ops."""
+        for layer in self.layers:
+            layer.pin_current()
 
     @torch.inference_mode()
     def get_state(self):

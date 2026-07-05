@@ -151,6 +151,15 @@ class WorldEngine:
         self._cache_pass(x0, inputs, self.kv_cache)
         return (self.vae.decode(x0.squeeze(1)) if return_img else x0.squeeze(1))
 
+    @torch.inference_mode()
+    def pin_frame(self):
+        """Object/scene permanence: persist the most recently cached frame into the KV
+        pin slots so it survives ring-buffer eviction. Call after the gen_frame /
+        append_frame whose content should be remembered. No-op unless the engine was
+        created with model_config_overrides={"n_pin_frames": N>0}. Runs eagerly between
+        compiled steps (a static-shape buffer mutation, so no recompile)."""
+        self.kv_cache.pin_current()
+
     @torch.compile
     def _prep_inputs(self, x, ctrl=None):
         self._ctx["button"].zero_()

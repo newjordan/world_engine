@@ -120,10 +120,12 @@ def build_controls(arm: str, K: int, trajectory: str, yaw_mag: float = 0.2):
 class RealEngine:
     """Thin adapter over world_engine.WorldEngine."""
 
-    def __init__(self, model_uri, device, quant, pin_frames):
+    def __init__(self, model_uri, device, quant, pin_frames, pin_all_layers=False):
         from world_engine import WorldEngine, CtrlInput  # local import: touches CUDA
         self._CtrlInput = CtrlInput
-        overrides = {"n_pin_frames": pin_frames} if pin_frames else None
+        overrides = None
+        if pin_frames:
+            overrides = {"n_pin_frames": pin_frames, "pin_all_layers": pin_all_layers}
         self.engine = WorldEngine(model_uri, quant=quant, device=device,
                                   model_config_overrides=overrides)
         self.device = self.engine.device
@@ -305,7 +307,8 @@ def sweep(args):
         eng = FakeEngine(horizon=16)
     else:
         eng = RealEngine(args.model, device, args.quant,
-                         args.pin_frames if args.pin_at_reference else 0)
+                         args.pin_frames if args.pin_at_reference else 0,
+                         pin_all_layers=args.pin_all_layers)
     lpips_fn = None if args.self_test or args.no_lpips else make_lpips(eng.device)
 
     os.makedirs(args.out, exist_ok=True)
@@ -446,6 +449,8 @@ def main():
     # Phase 3
     ap.add_argument("--pin-at-reference", action="store_true", help="pin the reference frame (Phase 3)")
     ap.add_argument("--pin-frames", type=int, default=4, help="n_pin_frames when pinning")
+    ap.add_argument("--pin-all-layers", action="store_true",
+                    help="pin into local layers too (default: global layers only)")
     # modes
     ap.add_argument("--self-test", action="store_true", help="CPU synthetic dry-run (no model)")
     ap.add_argument("--analyze", metavar="OUT_DIR", help="only aggregate an existing OUT_DIR/results.csv")
