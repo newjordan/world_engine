@@ -68,7 +68,7 @@ engine = WorldEngine("Overworld/Waypoint-1.5-1B", device="cuda")
 engine.set_prompt("A fun game")
 
 # Optional: Force the next frame to be a specific image
-img = pipeline.append_frame(uint8_img)  # (H, W, 3)
+img = engine.append_frame(uint8_img)  # (H, W, 3)
 
 # Generate 3 video frames conditioned on controller inputs
 for controller_input in [
@@ -142,7 +142,7 @@ Instead of generating, **set** the next frame as a specific image. Typically don
 ```py
 # example: random noise image
 uint8_img = torch.randint(0, 256, (512, 512, 3), dtype=torch.uint8)
-img = pipeline.append_frame(uint8_img)  # returns passed image
+img = engine.append_frame(uint8_img)  # returns passed image
 ```
 
 Note: returned `img` is always on the same device as `engine.device`
