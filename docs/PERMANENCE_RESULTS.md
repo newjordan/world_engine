@@ -100,9 +100,86 @@ rightward yaw; the returned frame matches the reference (same vending machine, w
 puddle, HUD weapon). **The mirrored-yaw trajectory returns the camera** → the sweep
 uses `--trajectory yaw`. (Strafe fallback `--trajectory strafe` remains available.)
 
-### 2b–2d — Sweep
+### 2b — Three-arm protocol
 
-_(pending — running)_
+Per (scene, seed, K), after an 8-frame settle whose last decoded RGB frame is the
+**reference view A**:
+
+| Arm | Trajectory | Scored frame B | Isolates |
+|---|---|---|---|
+| **still** | K no-op frames (camera static) | frame at step K | autoregressive drift only (memory always intact — the view never leaves) |
+| **revisit** | pan-away K/2 → pan-back K/2 | returned frame | drift **+ forgetting** |
+| **oracle** | `get_state` → run revisit → `load_state` → 1 frame | 1 frame from restored state | sampling-noise floor (perfect memory) |
+
+Metrics: **PSNR** + **SSIM** (luma, 11×11 Gaussian) on (A, B). Each trial reset +
+reseeded (`torch.manual_seed`); fresh `CtrlInput` per step. Sweep: **3 scenes × 5
+seeds × 6 K × 3 arms = 270 trials**, all completed, 0 errors. Every row in
+`bench_out/sweep/results.csv`.
+
+### 2c–2d — The forgetting curve
+
+Mean ± std over 3 scenes × 5 seeds (15 trials per cell):
+
+**PSNR (dB)**
+
+| K | still | revisit | **revisit − still** |
+|---|---|---|---|
+| 8 | 32.93 ± 2.40 | 25.48 ± 2.21 | −7.45 |
+| 16 *(= local horizon)* | 29.72 ± 2.05 | 22.72 ± 1.97 | −7.00 |
+| 32 | 27.25 ± 3.00 | 18.76 ± 1.77 | −8.49 |
+| 64 | 26.26 ± 2.56 | 16.21 ± 1.90 | **−10.05** |
+| 128 *(= global horizon)* | 23.98 ± 2.13 | 14.84 ± 1.67 | −9.15 |
+| 256 | 20.55 ± 1.36 | 12.66 ± 1.26 | −7.89 |
+
+**SSIM**
+
+| K | still | revisit | **revisit − still** |
+|---|---|---|---|
+| 8 | 0.952 | 0.776 | −0.176 |
+| 16 | 0.935 | 0.718 | −0.217 |
+| 32 | 0.909 | 0.615 | −0.294 |
+| 64 | 0.918 | 0.577 | **−0.341** |
+| 128 | 0.885 | 0.554 | −0.331 |
+| 256 | 0.832 | 0.493 | −0.339 |
+
+![baseline forgetting curve](./permanence_assets/forgetting_curve_baseline.png)
+
+**Headline:** panning away and returning costs **7–10 dB PSNR / 0.18–0.34 SSIM**
+relative to holding the camera still, and the gap **grows as the excursion crosses
+the 16-frame local horizon**, peaking at **K = 32–64** (2–4× local horizon) — exactly
+where the 18 local layers have evicted the reference view and only the 6 dilated
+global layers remain. Past the global horizon (K ≥ 128) the *still* arm itself starts
+drifting (static-scene autoregressive decay), so the gap narrows even as both arms
+degrade. The scene is **forgotten**, not merely noised: the effect is ~5× the
+sampling/oracle floor and far outside the seed-to-seed std.
+
+**Qualitative** (`docs/permanence_assets/example_revisit_K64_A_vs_B.png`, A | returned-B
+at K=64): the returned view is recognizably the same alley (vending machine, red
+pillar, puddle, HUD weapon) but the **specifics have hallucinated** — the vending
+machine has shifted and recolored, geometry has drifted. The model keeps the *gist*
+and loses the *detail*, the signature of ring-buffer eviction.
+
+![revisit K=64 A vs B](./permanence_assets/example_revisit_K64_A_vs_B.png)
+
+**Caveats.**
+- *Camera-return approximation*: mirrored yaw returns the heading only approximately,
+  contributing a roughly K-independent offset (already ~7 dB at K=8, within the local
+  horizon). The **forgetting-specific** signal is the *growth* of the gap with K.
+- *Metrics*: PSNR punishes sub-pixel view offsets; SSIM + the contact sheets guard the
+  interpretation. LPIPS optional (not installed here).
+- *Oracle*: the oracle numbers in `bench_out/sweep` are **contaminated** — they were
+  produced before the `get_state`/`load_state` VAE-state fix (see below), so they drift
+  with K instead of being a flat floor. A clean oracle re-run replaces them below.
+- Single model / single checkpoint.
+
+### Engine fix surfaced by the oracle arm
+
+The oracle arm exposed a real bug: `WorldEngine.get_state()` claimed to capture the
+world state but omitted the **TAEHV streaming decoder/encoder temporal buffers**, so
+`load_state` left them at their post-excursion values — a restored state kept decoding
+frames from the pre-snapshot stream. Fixed in `src/ae.py` + `src/world_engine.py`
+(deep-clone of the 7 `StreamingTAEHV.reset()` state fields; backward-compatible with
+older snapshots). Regression tests in `examples/test_ae_state.py`.
 
 ## Phase 3 — KV frame-pinning
 
