@@ -79,7 +79,30 @@ plan's 2048-frame worst case.
 
 ## Phase 2 — Revisit-consistency benchmark
 
-_(pending)_
+Harness: `examples/permanence_bench.py` (arms still/revisit/oracle, PSNR+SSIM,
+incremental CSV, A|B contact sheets, `--self-test` CPU dry-run). Model:
+`Overworld/Waypoint-1.5-1B`, bf16, NVIDIA GB10. First `gen_frame` compiles
+(max_autotune + cudagraphs). Autotune confirmed the Phase-1 KV shapes: local layers
+KV length 8704 (16·512 + 512 tail), global layers 66048 (128·512 + 512 tail).
+
+### 2a — Camera-return pilot (gate: PASSED)
+
+Trajectory: **pure yaw**, `mouse=[±0.2, 0]`, K/2 right then K/2 left, after an
+8-frame settle. Pilot at K=12 (excursion within the local horizon), 1 scene:
+
+| Comparison | PSNR | SSIM | expectation |
+|---|---|---|---|
+| A vs away (furthest pan) | 16.00 | 0.573 | LOW — view moved ✓ |
+| A vs B (returned) | 22.48 | 0.697 | HIGH — view returned ✓ |
+
+Verified visually (`bench_out/pilot/…_A_away_B.png`): the middle frame is a clean
+rightward yaw; the returned frame matches the reference (same vending machine, wall,
+puddle, HUD weapon). **The mirrored-yaw trajectory returns the camera** → the sweep
+uses `--trajectory yaw`. (Strafe fallback `--trajectory strafe` remains available.)
+
+### 2b–2d — Sweep
+
+_(pending — running)_
 
 ## Phase 3 — KV frame-pinning
 

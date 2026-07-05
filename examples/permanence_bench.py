@@ -144,6 +144,9 @@ class RealEngine:
     def last_rgb(self, four):
         return four[-1].detach().cpu().numpy()
 
+    def all_rgb(self, four):
+        return four.detach().cpu().numpy()  # (4, H, W, 3)
+
     def get_state(self):
         return self.engine.get_state()
 
@@ -211,6 +214,9 @@ class FakeEngine:
 
     def last_rgb(self, four):
         return four[-1]
+
+    def all_rgb(self, four):
+        return four
 
     def get_state(self):
         return dict(yaw=self.yaw, pos=self.pos.copy(), t=self.t, exc=self.max_excursion)
@@ -354,6 +360,62 @@ def sweep(args):
 
 
 # --------------------------------------------------------------------------- #
+# Pilot (Phase 2a): validate that the excursion trajectory returns the camera.
+# --------------------------------------------------------------------------- #
+def pilot(args):
+    """Settle -> pan away K/2 -> pan back K/2 for one scene, writing the full video
+    plus an A|away|B contact sheet. The trajectory is validated iff panning changes
+    the view (PSNR(A, away) low) AND returning restores it (PSNR(A, B) high)."""
+    import imageio.v3 as iio
+
+    K = int(args.K.split(",")[0])
+    eng = RealEngine(args.model, args.device, args.quant, 0)
+    seeds = load_seeds(1, args.assets, self_test=False)
+    scene_name, seed_x4 = seeds[0]
+    seed = args.seed_base
+
+    torch.manual_seed(seed)
+    eng.reset()
+    eng.append_seed(seed_x4)
+
+    video = [np.repeat(seed_x4[-1:].cpu().numpy(), 4, 0)]  # seed as first frames
+    A = None
+    for spec in _noop(args.settle):
+        four = eng.all_rgb(eng.gen(spec))
+        video.append(four)
+        A = four[-1]
+
+    away = None
+    excursion = build_controls("revisit", K, args.trajectory)
+    for i, spec in enumerate(excursion):
+        four = eng.all_rgb(eng.gen(spec))
+        video.append(four)
+        if i == K // 2 - 1:
+            away = four[-1]        # furthest point of the excursion
+    B = video[-1][-1]              # returned view
+
+    os.makedirs(args.out, exist_ok=True)
+    stem = os.path.join(args.out, f"pilot_{scene_name}_{args.trajectory}_K{K}")
+    frames = np.concatenate(video, axis=0)
+    iio.imwrite(stem + ".mp4", frames, fps=60, codec="libx264")
+    sheet = np.concatenate([cv2.cvtColor(x, cv2.COLOR_RGB2BGR) for x in (A, away, B)], axis=1)
+    cv2.imwrite(stem + "_A_away_B.png", cv2.resize(sheet, None, fx=0.5, fy=0.5))
+
+    p_away, s_away = psnr(A, away), ssim(A, away)
+    p_back, s_back = psnr(A, B), ssim(A, B)
+    print(f"\n=== PILOT {scene_name} trajectory={args.trajectory} K={K} ===")
+    print(f"  A vs away (furthest):  PSNR {p_away:6.2f}  SSIM {s_away:.3f}   (want LOW: view moved)")
+    print(f"  A vs B    (returned):  PSNR {p_back:6.2f}  SSIM {s_back:.3f}   (want HIGH: view returned)")
+    moved = p_away < p_back - 1.0
+    returned = p_back > p_away + 2.0
+    verdict = "PASS" if (moved and returned) else "CHECK"
+    print(f"  moved={moved} returned={returned}  ->  {verdict}")
+    print(f"  video:  {stem}.mp4")
+    print(f"  frames: {stem}_A_away_B.png")
+    return stem
+
+
+# --------------------------------------------------------------------------- #
 # Analysis (Phase 2d)
 # --------------------------------------------------------------------------- #
 def analyze(out_dir):
@@ -453,11 +515,15 @@ def main():
                     help="pin into local layers too (default: global layers only)")
     # modes
     ap.add_argument("--self-test", action="store_true", help="CPU synthetic dry-run (no model)")
+    ap.add_argument("--pilot", action="store_true", help="Phase 2a: validate camera-return trajectory")
     ap.add_argument("--analyze", metavar="OUT_DIR", help="only aggregate an existing OUT_DIR/results.csv")
     args = ap.parse_args()
 
     if args.analyze:
         analyze(args.analyze)
+        return
+    if args.pilot:
+        pilot(args)
         return
     out = sweep(args)
     analyze(os.path.dirname(out) or ".")
