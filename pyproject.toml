@@ -40,4 +40,5 @@ dev = [
   "opencv-python",
   "imageio[pyav]",
   "numpy",
+  "matplotlib",
 ]

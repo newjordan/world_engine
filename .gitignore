@@ -1,5 +1,10 @@
 scratch/
 
+# permanence benchmark (examples/permanence_bench.py) — cached seeds + trial outputs
+bench_assets/
+bench_out/
+selftest_out/
+
 # Sphinx documentation
 docs/build/
 docs/_build/
