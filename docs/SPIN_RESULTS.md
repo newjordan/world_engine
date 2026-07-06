@@ -14,38 +14,42 @@
 
 ## TL;DR
 
-1. **In-run self-calibration works — two independent estimators agree.** The SLAM arm
-   measures the world's true revolution period *from its own frames* (appearance loop
-   closure at the phase re-intersection point): **971 cmd-units/rev**, vs **940** from
-   the Phase-6.5-style cross-run content calibration — 3% apart. The spin no longer
-   needs an oracle from a separate run.
-2. **Perceptual aliasing is severe in a generative world — and now handled.** The naive
-   closure rule (Phase 6.5 spirit: match + short streak) false-fires *repeatedly*: this
-   world produced closure candidates at 0.5–0.7 of the true period with appearance NCC
-   up to **0.91**. Consensus voting + post-closure verification caught and **revoked 3
-   false closures** (each within 15–41 frames, by residual inconsistency) before the
-   true one (11 votes, survives verification) locked in.
-3. **Memory injection keeps the world *dynamically* alive, not just visually.** New
-   finding: the no-memory baseline's content rotation *collapses* as its world degrades
-   — 1100 identical yaw commands turn it only **474°** (long stalls where confident
-   phase correlation reads ~0 motion: the model stops responding). With atlas memory
-   active the same commands turn the world **872°** (SLAM-keyed) / **1124°**
-   (command-keyed). Forgetting doesn't just replace the scenery; it breaks the
-   world's response to controls.
-4. **The world visibly comes back after 360°.** At the best-gain heading the baseline's
-   lap 2 is a dune field where an alley used to be; the SLAM arm's lap 2 re-renders the
-   same buildings-and-fence scene, degraded but structurally *the same world*
-   (loop-closure grid below). PSNR gain at that heading is modest (+0.7 dB
-   self-consistency) and **understates the qualitative difference** — most of the error
-   budget is texture fidelity, not scene identity.
-5. **⇒ The remaining gap is squarely the training-side ask.** Retrieval geometry is now
-   solved end-to-end (right keyframe, right period, in-run, alias-robust). What limits
-   lap-2 fidelity is the frozen attention's weak weighting of injected memory — same
-   ceiling Phase 6 quantified — plus the turn-rate collapse, which no inference-side
-   memory fully prevents.
+1. **In-run self-calibration is the only calibration that exists.** The SLAM arm
+   measures the world's revolution period from its own frames (appearance loop closure
+   at the phase re-intersection point). Surviving periods span **805–1063
+   cmd-units/rev across scenes and across sessions of the same scene+seed** — the turn
+   rate is a property of the realized world, not the checkpoint, so the Phase-6.5
+   cross-run oracle is incoherent in principle. Where both estimators were healthy they
+   agreed to 3% (971 vs 940).
+2. **Perceptual aliasing is severe in a generative world — and now handled.** The model
+   renders closure-lookalikes at 0.5–0.8 of the true period with appearance NCC up to
+   **0.91**; a naive match-plus-streak rule false-fires repeatedly. Consensus voting +
+   provisional-closure verification **revoked 22 false closures across the 6-trial
+   sweep with zero wrong periods retained** (two trials correctly ended open rather
+   than committing to a bad map).
+3. **Memory injection keeps the world *dynamically* alive — the robust, replicated
+   effect (6/6 trials).** The no-memory baseline's rotation collapses as its world
+   degrades: it failed to complete even one revolution in 3/6 trials (200–275° from
+   1100 identical yaw commands; confident phase correlation reads the world as static —
+   the model stops responding). The SLAM-keyed atlas arm completed the full second
+   revolution in **every trial**. Forgetting doesn't just replace scenery; it breaks
+   the world's response to controls.
+4. **The world visibly comes back after 360° — but the fidelity gain is a PSNR null.**
+   Qualitatively: baseline lap 2 renders a dune field where an alley was; the SLAM arm
+   re-renders the same buildings-and-fence scene (grid below). Quantitatively, paired
+   lap-2 self-consistency does **not** beat baseline across the sweep (atlas_dr
+   +0.10 ± 1.40, atlas_slam −0.84 ± 1.07 dB over the 3 pairable trials) — single-trial
+   gains sit inside run-to-run variance, and most of the error budget is texture
+   fidelity, not scene identity.
+5. **⇒ The remaining gap is squarely the training-side ask.** Retrieval geometry is
+   solved end-to-end (right keyframe, right period, in-run, alias-robust) and keeps the
+   world responsive; what it cannot buy at this operating point is reconstruction
+   fidelity — the frozen attention's weak weighting of injected memory (the Phase-6
+   ceiling). Next inference-side lever worth one experiment: inject memory via the
+   **latent-init channel** (warm-start denoising from the retrieved keyframe's x0,
+   renoised to mid-σ) instead of only the KV channel.
 
-Single-trial numbers below (scene seed_00, seed 1236); a 6-trial sweep
-(3 seeds × 2 scenes) is in `bench_out/spin_slam/sweep/` — see **Sweep** section.
+Single-trial detail below (scene seed_00, seed 1236); sweep table in **Sweep**.
 
 ---
 
@@ -150,11 +154,50 @@ says the world should be turning; pull it") — is the obvious Phase-7.5 mechani
 
 ---
 
-## Sweep (3 seeds × 2 scenes)
+## Sweep (3 seeds × 2 scenes, 6 trials)
 
-*Pending — running in `bench_out/spin_slam/sweep/` (`all.csv`, per-trial
-`summary.json`). This section will report per-trial closure/calibration outcomes and
-paired lap-2 statistics.*
+Raw data: `bench_out/spin_slam/sweep/` (`all.csv`, per-trial `summary.json`,
+`sweep.log`). Per-trial outcomes:
+
+| trial | baseline lap-1 | closure outcome | revoked | self-PSNR base / dr / slam |
+|---|---|---|---|---|
+| s0·1236 | 856 fr (degenerate) | ✓ survived, 1063 cmd-u | 4 | 11.08 / 12.36 / **13.09** |
+| s0·1237 | 342 fr (healthy) | ✗ ended open | 4 | **14.34** / 13.49 / 12.30 |
+| s0·1238 | 427 fr | ✓ survived, 928 cmd-u | 3 | **13.21** / 12.20 / 12.02 |
+| s1·1236 | never finished | ✓ survived, 861 cmd-u | 2 | — / **13.99** / 12.53 |
+| s1·1237 | never finished | ✓ survived, 805 cmd-u | 3 | — / **13.40** / 12.37 |
+| s1·1238 | never finished | ✓ young at run end, 507 cmd-u (unverified) | 6 | — / **13.67** / 13.03 |
+
+**1. The PSNR gain does not survive the sweep — reported as a null.** Only 3 trials
+have a pairable baseline lap 2 at all; on those, paired-by-heading-bin diffs are
+**atlas_dr +0.10 ± 1.40 dB** and **atlas_slam −0.84 ± 1.07 dB**. The single-trial
++0.7 dB was within run-to-run variance. Notably the one *healthy-world* trial
+(s0·1237, lap-1 = 342 frames, the Phase-6.5 regime) is also the one where every SLAM
+closure was revoked — closure-churn (retrieval key thrashing between linear and
+circular) plausibly *hurt* generation there. Fidelity on revisit is not an
+inference-side win at this operating point.
+
+**2. The dynamics finding replicates 6/6 — this is the robust effect.**
+`atlas_slam` completed the full second revolution in **every trial** (max lap-2
+heading 359–360°). `atlas_dr` completed 5/6 (one reached 136°). The no-memory
+baseline **never reached lap 2 in 3/6 trials** (203°, 200°, 275° total after 1100
+commands), stalled at the wrap in a 4th, and completed lap 2 in only 2/6. Pose-indexed
+memory is what keeps the world *turning*.
+
+**3. Calibration: there is no cross-session period to calibrate against.** Surviving
+in-run periods span **805–1063 cmd-units/rev** across scenes *and* across sessions of
+the same scene+seed (971 in the single-trial run vs 1063 in the sweep for s0·1236).
+The turn rate is a property of the *realized world*, not the checkpoint — cross-run
+calibration (Phase 6.5, `atlas_dr`) is incoherent in principle, not merely imprecise.
+In-run closure is the only well-posed estimator, which retroactively justifies the
+SLAM investment even where PSNR is flat.
+
+**4. The aliasing defense held everywhere: 22 false closures revoked, zero wrong
+periods retained.** False periods cluster at 3100–5600 px (0.5–0.8 of a revolution) —
+the model's characteristic self-similarity scale. Two trials correctly ended *open*
+(every candidate revoked) rather than committing to a bad map; one trial's final
+closure was younger than the verification horizon at run end and should be read as
+unverified.
 
 ---
 
@@ -193,9 +236,10 @@ the injected key; train it in.* Phase 7 sharpens that in three ways:
    in-run, robust to the aliasing a generative world actually produces. Any remaining
    permanence failure on a spin is the model, not the memory.
 2. **A new, crisper symptom for the training team:** forgetting breaks *dynamics*, not
-   just appearance — the world stops turning under constant yaw once content degrades
-   (474° per 1100 commands vs 872–1124° with memory). "Trained-in pose-indexed memory"
-   should be evaluated on control-responsiveness, not only reconstruction.
+   just appearance — the no-memory world failed to complete one revolution in 3/6
+   sweep trials while the SLAM-keyed arm completed two revolutions in 6/6.
+   "Trained-in pose-indexed memory" should be evaluated on control-responsiveness,
+   not only reconstruction.
 3. **The aliasing result is a training-data argument:** the model renders
    near-duplicate content at wrong headings (NCC 0.9 at 0.5–0.7 rev). A model trained
    to *read* pose-indexed memory would be pulled toward pose-consistent rendering,
