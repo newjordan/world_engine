@@ -192,11 +192,15 @@ def _pin_layers(kv_cache):
             yield li, layer
 
 
-def atlas_capture(engine, store) -> bool:
+def atlas_capture(engine, store, yaw: Optional[float] = None) -> bool:
     """Snapshot the current (just-generated) frame's pin-capable-layer KV into `store`,
     tagged with the engine's dead-reckoned camera yaw and frame index. Call right after
     the gen_frame / append_frame whose content should be remembered — same timing as
-    engine.pin_frame(). Returns True iff a new keyframe was stored (novelty gate)."""
+    engine.pin_frame(). Returns True iff a new keyframe was stored (novelty gate).
+
+    `yaw` overrides the pose tag (default: engine.camera_yaw). Used by the SLAM-keyed
+    spin arm (examples/slam.py) to key the store in CONTENT space (visual-odometry px)
+    instead of command space — same store geometry, different coordinate system."""
     payload = {}
     for li, layer in _pin_layers(engine.kv_cache):
         # tail slice holds the current frame's post-RoPE KV: [2, B, H, tpf, Dh]
@@ -204,8 +208,9 @@ def atlas_capture(engine, store) -> bool:
         payload[li] = frame_kv.detach().to("cpu", copy=True)
     if not payload:
         return False  # engine has no pin slots (n_pin_frames == 0)
-    return store.insert(payload, yaw=float(engine.camera_yaw),
-                        frame_ts=int(engine.frame_ts) - 1)
+    if yaw is None:
+        yaw = float(engine.camera_yaw)
+    return store.insert(payload, yaw=float(yaw), frame_ts=int(engine.frame_ts) - 1)
 
 
 def _clear_pins(kv_cache):
@@ -218,14 +223,24 @@ def _clear_pins(kv_cache):
 
 
 def atlas_activate(engine, store, offset: int = 8, k: int = 1,
-                   align_pose: bool = True, retrieve: str = "nearest") -> int:
+                   align_pose: bool = True, retrieve: str = "nearest",
+                   yaw: Optional[float] = None) -> int:
     """Retrieve the k nearest stored keyframes to the current heading, page them (fresh,
     un-rotated) into the pin slots, and restamp each by ITS OWN residual to a recent
     in-distribution offset aligned to the current yaw. Call just before gen_frame during
     a revisit. `retrieve` is passed to AtlasStore.query ('nearest' | 'farthest', the
-    latter a control). Returns the number of keyframes activated (0 if the store empty)."""
+    latter a control). Returns the number of keyframes activated (0 if the store empty).
+
+    `yaw` overrides the retrieval query pose (default: engine.camera_yaw), for stores
+    keyed in a different coordinate system (e.g. SLAM content-space px). The spatial
+    restamp target (align_pose=True) still uses engine.camera_yaw — RoPE residuals are
+    in command units — so an overridden-key store should use align_pose=False unless
+    its keys share the engine's yaw units (retrieval is what does the aligning; see
+    ATLAS_RESULTS.md ablation: spatial restamp is a no-op at atlas-small residuals)."""
     kv_cache = engine.kv_cache
-    hits = store.query(float(engine.camera_yaw), k=k, mode=retrieve)
+    if yaw is None:
+        yaw = float(engine.camera_yaw)
+    hits = store.query(float(yaw), k=k, mode=retrieve)
     _clear_pins(kv_cache)  # deterministic active set: only this frame's retrieval
     for slot, hit in enumerate(hits):
         for li, layer in _pin_layers(kv_cache):

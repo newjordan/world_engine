@@ -166,14 +166,15 @@ class RealEngine:
     def attach_atlas(self, store):
         self._atlas = store
 
-    def atlas_capture(self):
+    def atlas_capture(self, yaw=None):
         from atlas import atlas_capture as _cap
-        return _cap(self.engine, self._atlas)
+        return _cap(self.engine, self._atlas, yaw=yaw)
 
-    def atlas_activate(self, offset=8, k=1, align_pose=True, retrieve="nearest"):
+    def atlas_activate(self, offset=8, k=1, align_pose=True, retrieve="nearest",
+                       yaw=None):
         from atlas import atlas_activate as _act
         return _act(self.engine, self._atlas, offset=offset, k=k,
-                    align_pose=align_pose, retrieve=retrieve)
+                    align_pose=align_pose, retrieve=retrieve, yaw=yaw)
 
 
 class FakeEngine:
@@ -258,13 +259,14 @@ class FakeEngine:
         self._atlas = store
         self._mem_relief = 0.0
 
-    def atlas_capture(self):
+    def atlas_capture(self, yaw=None):
         # payload is irrelevant in the synthetic world; only the pose tag matters.
-        return self._atlas.insert(kv=None, yaw=self.yaw, frame_ts=self.t)
+        return self._atlas.insert(kv=None, yaw=self.yaw if yaw is None else yaw,
+                                  frame_ts=self.t)
 
     def atlas_activate(self, offset=8, k=1, align_pose=True, retrieve="nearest",
-                       relief_scale=0.8):
-        hits = self._atlas.query(self.yaw, k=k, mode=retrieve)
+                       relief_scale=0.8, yaw=None):
+        hits = self._atlas.query(self.yaw if yaw is None else yaw, k=k, mode=retrieve)
         if not hits:
             self._mem_relief = 0.0
             return 0
