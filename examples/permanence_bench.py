@@ -162,6 +162,19 @@ class RealEngine:
         else:
             self.engine.restamp_memory(offset)
 
+    # --- pose-indexed world atlas (Phase 6) -------------------------------------
+    def attach_atlas(self, store):
+        self._atlas = store
+
+    def atlas_capture(self):
+        from atlas import atlas_capture as _cap
+        return _cap(self.engine, self._atlas)
+
+    def atlas_activate(self, offset=8, k=1, align_pose=True, retrieve="nearest"):
+        from atlas import atlas_activate as _act
+        return _act(self.engine, self._atlas, offset=offset, k=k,
+                    align_pose=align_pose, retrieve=retrieve)
+
 
 class FakeEngine:
     """
@@ -200,6 +213,10 @@ class FakeEngine:
         if self.max_excursion > self.horizon:
             over = (self.max_excursion - self.horizon) / self.horizon
             err = self.forget * 255 * min(over, 1.0)
+        # Atlas relief: a retrieved near-heading keyframe suppresses forgetting error for
+        # this frame (synthetic analogue of restamping an in-distribution memory). Set by
+        # atlas_activate(), consumed once, reset in gen().
+        err *= (1.0 - getattr(self, "_mem_relief", 0.0))
         noise = self._rng.normal(0, drift_sigma + err, view.shape)
         return np.clip(view + noise, 0, 255).astype(np.uint8)
 
@@ -215,6 +232,7 @@ class FakeEngine:
         steps_away = (abs(self.yaw) + abs(self.pos[0])) / 0.2
         self.max_excursion = max(self.max_excursion, steps_away)
         frame = self._render()
+        self._mem_relief = 0.0  # relief applies to exactly the frame after activate
         return np.stack([frame] * 4, 0)  # mimic (4,H,W,3)
 
     def last_rgb(self, four):
@@ -234,6 +252,27 @@ class FakeEngine:
 
     def restamp_memory(self, offset, align_pose=False):
         pass  # synthetic world has no KV to re-stamp; restamp arm ~= revisit here
+
+    # --- pose-indexed world atlas (Phase 6): simulate memory relief ------------
+    def attach_atlas(self, store):
+        self._atlas = store
+        self._mem_relief = 0.0
+
+    def atlas_capture(self):
+        # payload is irrelevant in the synthetic world; only the pose tag matters.
+        return self._atlas.insert(kv=None, yaw=self.yaw, frame_ts=self.t)
+
+    def atlas_activate(self, offset=8, k=1, align_pose=True, retrieve="nearest",
+                       relief_scale=0.8):
+        hits = self._atlas.query(self.yaw, k=k, mode=retrieve)
+        if not hits:
+            self._mem_relief = 0.0
+            return 0
+        # A near-heading keyframe gives strong relief; a far one gives none. relief_scale
+        # is in the same yaw-accumulator units as the capture spacing.
+        resid = abs(self.yaw - hits[0].yaw)
+        self._mem_relief = max(0.0, 1.0 - resid / relief_scale)
+        return len(hits)
 
 
 # --------------------------------------------------------------------------- #
