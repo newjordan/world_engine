@@ -55,6 +55,77 @@ def make_block_mask(T: int, L: int, written: torch.Tensor) -> BlockMask:
     )
 
 
+def restamp_temporal_k(k: Tensor, delta: float, inv_t: Tensor, n_spatial_pairs: int) -> Tensor:
+    """Re-position a post-RoPE key in *time* by `delta` frames, exactly.
+
+    OrthoRoPE (see model/attn.py) rotates each freq-pair (a,b) by its angle and stores
+    the result de-interleaved as two concatenated halves: k = [y0_0..y0_{h-1} |
+    y1_0..y1_{h-1}] where (y0_k, y1_k) = R(theta_k) . (a_k, b_k). Temporal RoPE is
+    relative and ts_mult == 1, so a key roped at frame f is turned into the key it would
+    have been at frame f+delta by composing an extra rotation R(delta * inv_t) on the
+    temporal freq-pairs only — the spatial x/y pairs (the first `n_spatial_pairs` freqs)
+    are left untouched, so the key keeps its pixel identity but moves in time.
+
+    k: [..., d_head] post-RoPE key(s). Returns a new tensor of the same shape/dtype.
+    """
+    half = k.shape[-1] // 2
+    n_t = inv_t.numel()
+    assert n_spatial_pairs + n_t == half, (n_spatial_pairs, n_t, half)
+    phi = k.new_zeros(half, dtype=torch.float32)
+    phi[n_spatial_pairs:] = inv_t.to(torch.float32) * float(delta)
+    cos, sin = phi.cos(), phi.sin()
+    kf = k.float()
+    k0, k1 = kf[..., :half], kf[..., half:]
+    out = torch.cat((k0 * cos - k1 * sin, k1 * cos + k0 * sin), dim=-1)
+    return out.to(k.dtype)
+
+
+def restamp_pose_k(
+    k: Tensor,
+    dx_norm: float,
+    dy_norm: float,
+    dt: float,
+    xy: Tensor,
+    inv_t: Tensor,
+    n_x_pairs: int,
+    n_y_pairs: int,
+) -> Tensor:
+    """Re-position a post-RoPE key by the full (x, y, t) camera-pose delta, exactly.
+
+    Extends restamp_temporal_k to also rotate the spatial x/y RoPE phases, so a pinned
+    keyframe captured at camera pose P_pin is turned into the key it would have been had
+    it been captured at P_pin + (dx, dy, dt). This aligns the memory's spatial phase
+    with the current camera heading, closing the spatial mismatch that pure temporal
+    restamping leaves open.
+
+    The additional rotation angle per freq-pair:
+      x pairs [0, n_x):           xy[i]      * dx_norm
+      y pairs [n_x, n_x+n_y):     xy[i-n_x]  * dy_norm
+      t pairs [n_x+n_y, half):    inv_t[j]   * dt
+
+    where dx_norm = 2*dx_pixels/W, dy_norm = 2*dy_pixels/H (the derivative of the
+    OrthoRoPEAngles normalized coordinate w.r.t. pixel position). All tokens in a frame
+    share the same camera-pose delta, so a single phi vector rotates every token.
+
+    k: [..., d_head] post-RoPE key(s). Returns a new tensor of the same shape/dtype.
+    xy: [n_x_pairs] spatial inverse-frequency vector (= OrthoRoPEAngles.xy).
+    inv_t: [n_t_pairs] temporal inverse-frequency vector.
+    """
+    half = k.shape[-1] // 2
+    n_t = inv_t.numel()
+    n_spatial = n_x_pairs + n_y_pairs
+    assert n_spatial + n_t == half, (n_x_pairs, n_y_pairs, n_t, half)
+    phi = k.new_zeros(half, dtype=torch.float32)
+    phi[:n_x_pairs] = xy[:n_x_pairs].to(torch.float32) * float(dx_norm)
+    phi[n_x_pairs:n_spatial] = xy[:n_y_pairs].to(torch.float32) * float(dy_norm)
+    phi[n_spatial:] = inv_t.to(torch.float32) * float(dt)
+    cos, sin = phi.cos(), phi.sin()
+    kf = k.float()
+    k0, k1 = kf[..., :half], kf[..., half:]
+    out = torch.cat((k0 * cos - k1 * sin, k1 * cos + k0 * sin), dim=-1)
+    return out.to(k.dtype)
+
+
 class LayerKVCache(nn.Module):
     """
     Ring-buffer KV cache with fixed capacity L (tokens) for history plus, optionally,
@@ -103,18 +174,32 @@ class LayerKVCache(nn.Module):
         self.frame_offsets = nn.Buffer(torch.arange(self.tpf, dtype=torch.long), persistent=False)
         self.current_idx = nn.Buffer(self.frame_offsets + self.tail_start, persistent=False)
         self._pin_slot = 0  # round-robin write pointer for pin_current()
+        # Effective temporal position (frame idx) each pin slot's key is currently roped
+        # to; -1 = empty. Tracked so restamp_pins() can compute exact integer deltas.
+        self.pin_f = nn.Buffer(torch.full((max(n_pin_frames, 1),), -1, dtype=torch.long), persistent=False)
+        # Accumulated spatial pose (yaw-pixel-shift) each pin slot's key is roped to;
+        # None = unknown (spatial restamp skipped). Tracked so restamp_pins() can compute
+        # the spatial delta for pose-aligned loop closure.
+        self.pin_yaw = [None] * max(n_pin_frames, 1)
 
     def reset(self):
         self.kv.zero_()
         self.written.zero_()
         self.written[self.tail_start:].fill_(True)
         self._pin_slot = 0
+        self.pin_f.fill_(-1)
+        self.pin_yaw = [None] * max(self.n_pin_frames, 1)
 
     @torch.inference_mode()
-    def pin_current(self, slot: int = None):
+    def pin_current(self, slot: int = None, frame: int = None, yaw: float = None):
         """Copy the current tail frame's (post-RoPE) KV into a pin slot so it survives
         ring eviction. No-op when n_pin_frames == 0. Runs eagerly between generation
-        steps (a plain buffer mutation with static shapes -> no recompile)."""
+        steps (a plain buffer mutation with static shapes -> no recompile).
+
+        `frame` is the t_pos the pinned key is roped to (needed by restamp_pins); if
+        None the slot's timeline is left unset and restamp_pins will skip it.
+        `yaw` is the accumulated camera yaw-pixel-shift at pin time (needed for
+        pose-aligned restamp); if None the spatial phase is left unset."""
         if self.n_pin_frames == 0:
             return
         if slot is None:
@@ -124,6 +209,70 @@ class LayerKVCache(nn.Module):
         src = self.kv.index_select(3, self.current_idx)
         self.kv.index_copy_(3, dst, src)
         self.written[dst] = True
+        if frame is not None:
+            self.pin_f[slot] = int(frame)
+        if yaw is not None:
+            self.pin_yaw[slot] = float(yaw)
+
+    @torch.inference_mode()
+    def restamp_pins(
+        self,
+        inv_t: Tensor,
+        n_spatial_pairs: int,
+        target_f: int,
+        xy: Tensor = None,
+        target_yaw: float = None,
+        width: int = None,
+        height: int = None,
+    ):
+        """Re-position every populated pin slot's key in time to `target_f`, and
+        optionally in the spatial (yaw) phase to `target_yaw`.
+
+        Temporal restamp (always): composes R(dt * inv_t) on the temporal freq-pairs so
+        a keyframe captured long ago attends from an in-distribution recent offset.
+
+        Spatial restamp (when xy and target_yaw are provided): composes R(d_yaw *
+        xy[i]) on the x-pairs only, rotating the key's spatial phase to match the
+        current camera yaw. This closes the spatial mismatch that temporal-only
+        restamping leaves open — the memory's x-phase is aligned to where the camera
+        is now pointing, not where it was when the keyframe was pinned.
+
+        No-op when n_pin_frames == 0. Eager static-shape buffer edit (no recompile)."""
+        if self.n_pin_frames == 0:
+            return
+        n_x = n_y = n_spatial_pairs // 2  # x and y each get half the spatial pairs
+        for slot in range(self.n_pin_frames):
+            pf = int(self.pin_f[slot])
+            if pf < 0:
+                continue  # empty / timeline unknown
+            dt = int(target_f) - pf
+            # Compute spatial delta if we have both target and pinned yaw
+            do_spatial = (
+                xy is not None
+                and target_yaw is not None
+                and self.pin_yaw[slot] is not None
+                and width is not None
+            )
+            if dt == 0 and not do_spatial:
+                continue
+            dx_norm = 0.0
+            if do_spatial:
+                dyaw = float(target_yaw) - self.pin_yaw[slot]
+                # Convert accumulated yaw-pixel-shift to normalized coordinate delta:
+                # x_norm = (2*x_pos+1)/W - 1, so delta_x_norm = 2*dx_pixels/W
+                dx_norm = 2.0 * dyaw / float(width)
+            lo = self.pin_start + slot * self.tpf
+            hi = lo + self.tpf
+            if do_spatial:
+                self.kv[0, :, :, lo:hi, :] = restamp_pose_k(
+                    self.kv[0, :, :, lo:hi, :], dx_norm, 0.0, dt,
+                    xy, inv_t, n_x, n_y)
+            else:
+                self.kv[0, :, :, lo:hi, :] = restamp_temporal_k(
+                    self.kv[0, :, :, lo:hi, :], dt, inv_t, n_spatial_pairs)
+            self.pin_f[slot] = int(target_f)
+            if do_spatial:
+                self.pin_yaw[slot] = float(target_yaw)
 
     def upsert(self, kv: Tensor, pos_ids: TensorDict, is_frozen: bool):
         """
@@ -216,11 +365,33 @@ class StaticKVCache(nn.Module):
         self._is_frozen = True
 
     @torch.inference_mode()
-    def pin_current(self):
+    def pin_current(self, frame: int = None, yaw: float = None):
         """Pin the current frame in every layer that has pin slots (global layers by
-        default). Layers with n_pin_frames == 0 are no-ops."""
+        default). Layers with n_pin_frames == 0 are no-ops. `frame` records the pinned
+        key's t_pos and `yaw` its camera yaw-pixel-shift so restamp_memory() can
+        re-position it later (temporally and spatially)."""
         for layer in self.layers:
-            layer.pin_current()
+            layer.pin_current(frame=frame, yaw=yaw)
+
+    @torch.inference_mode()
+    def restamp_memory(
+        self,
+        inv_t: Tensor,
+        n_spatial_pairs: int,
+        target_f: int,
+        xy: Tensor = None,
+        target_yaw: float = None,
+        width: int = None,
+        height: int = None,
+    ):
+        """Re-position every layer's pinned keyframes to temporal offset `target_f` and
+        optionally to spatial yaw offset `target_yaw` so they attend from an
+        in-distribution recent position aligned with the current camera heading.
+        No-op for pin-less layers."""
+        for layer in self.layers:
+            layer.restamp_pins(
+                inv_t, n_spatial_pairs, target_f,
+                xy=xy, target_yaw=target_yaw, width=width, height=height)
 
     @torch.inference_mode()
     def get_state(self):

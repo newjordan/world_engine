@@ -87,6 +87,16 @@ class WorldEngine:
 
             self.kv_cache = StaticKVCache(self.model_cfg, batch_size=1, dtype=dtype).to(device=self.device)
 
+            # Temporal RoPE handles for keyframe re-stamping (object/scene permanence).
+            # inv_t: temporal inverse frequencies; n_spatial_pairs: the x/y RoPE freq-pairs
+            # that a re-stamp must leave untouched. Mirrors model/attn.py OrthoRoPEAngles.
+            d_head = self.model_cfg.d_model // self.model_cfg.n_heads
+            self._rope_inv_t = self.model.transformer.rope_angles.inv_t
+            self._rope_xy = self.model.transformer.rope_angles.xy
+            self._n_spatial_pairs = 2 * (d_head // 8)
+            self._lat_width = self.model_cfg.width
+            self._lat_height = self.model_cfg.height
+
             # Inference Scheduler
             self.scheduler_sigmas = torch.tensor(self.model_cfg.scheduler_sigmas, dtype=dtype, device=self.device)
 
@@ -97,6 +107,12 @@ class WorldEngine:
             assert self.model_cfg.base_fps % latent_fps == 0
             self.ts_mult = int(self.model_cfg.base_fps // latent_fps)
             self.frame_ts = torch.tensor([[0]], dtype=torch.long)
+
+            # Dead-reckoned camera pose for pose-aligned memory restamping.
+            # Accumulates the yaw velocity from mouse input so that on loop closure
+            # (revisit) we know the net heading offset between the pinned keyframe's
+            # capture pose and the current camera pose. yaw is in latent-pixel units.
+            self.camera_yaw = 0.0
 
             # Static input context tensors
             self._ctx = {
@@ -114,6 +130,7 @@ class WorldEngine:
         """Reset state for new generation"""
         self.kv_cache.reset()
         self.frame_ts.zero_()
+        self.camera_yaw = 0.0
         for v in self._ctx.values():
             v.zero_()
         self.vae.reset()
@@ -167,7 +184,34 @@ class WorldEngine:
         append_frame whose content should be remembered. No-op unless the engine was
         created with model_config_overrides={"n_pin_frames": N>0}. Runs eagerly between
         compiled steps (a static-shape buffer mutation, so no recompile)."""
-        self.kv_cache.pin_current()
+        # frame_ts already points at the NEXT frame, so the just-cached frame is ts-1.
+        self.kv_cache.pin_current(frame=int(self.frame_ts) - 1, yaw=self.camera_yaw)
+
+    @torch.inference_mode()
+    def restamp_memory(self, offset: int = 8, align_pose: bool = False):
+        """Object/scene permanence (loop closure): re-position the pinned keyframes so
+        they attend from an in-distribution recent offset (`offset` frames behind the
+        frame about to be generated) instead of the out-of-distribution far distance
+        that made static pinning a no-op.
+
+        When align_pose=True, also rotate the spatial (x/y) RoPE phase of each pinned
+        key by the dead-reckoned camera yaw delta — so the memory is aligned to the
+        current camera heading, not the heading at capture time. This is the full
+        (x,y,t) restamp: the key becomes what it would have been had it been generated
+        at the current pose minus `offset` frames.
+
+        Call just before gen_frame during a revisit. No-op unless the engine was created
+        with n_pin_frames > 0."""
+        target = int(self.frame_ts) - offset
+        if align_pose:
+            self.kv_cache.restamp_memory(
+                self._rope_inv_t, self._n_spatial_pairs, target,
+                xy=self._rope_xy, target_yaw=self.camera_yaw,
+                width=self._lat_width, height=self._lat_height,
+            )
+        else:
+            self.kv_cache.restamp_memory(
+                self._rope_inv_t, self._n_spatial_pairs, target)
 
     @torch.compile
     def _prep_inputs(self, x, ctrl=None):
@@ -191,6 +235,9 @@ class WorldEngine:
         ctrl.mouse = torch.as_tensor(ctrl.mouse).to(x.device, non_blocking=True)
         ctrl.scroll_wheel = torch.as_tensor(ctrl.scroll_wheel).to(x.device, non_blocking=True)
         ctx = self._prep_inputs(x, ctrl)
+
+        # Dead-reckon camera yaw from mouse input (x-component), for pose-aligned memory.
+        self.camera_yaw += float(ctrl.mouse[0])
 
         # prepare prompt conditioning
         if self.model_cfg.prompt_conditioning is None:

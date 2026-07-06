@@ -156,6 +156,12 @@ class RealEngine:
     def pin_frame(self):
         self.engine.pin_frame()
 
+    def restamp_memory(self, offset, align_pose=False):
+        if hasattr(self.engine, 'restamp_memory'):
+            self.engine.restamp_memory(offset, align_pose=align_pose)
+        else:
+            self.engine.restamp_memory(offset)
+
 
 class FakeEngine:
     """
@@ -174,7 +180,6 @@ class FakeEngine:
         self._rng = np.random.default_rng(seed)
         self._base = None
         self.reset()
-
     def reset(self):
         self.yaw = 0.0
         self.pos = np.zeros(2)
@@ -227,6 +232,9 @@ class FakeEngine:
     def pin_frame(self):
         pass
 
+    def restamp_memory(self, offset, align_pose=False):
+        pass  # synthetic world has no KV to re-stamp; restamp arm ~= revisit here
+
 
 # --------------------------------------------------------------------------- #
 # Seed images
@@ -268,18 +276,22 @@ def load_seeds(n, cache_dir, self_test=False):
 # --------------------------------------------------------------------------- #
 # One trial
 # --------------------------------------------------------------------------- #
-def run_trial(eng, seed_x4, seed, arm, K, settle, trajectory, pin_at_reference=False):
+def run_trial(eng, seed_x4, seed, arm, K, settle, trajectory, pin_at_reference=False,
+              restamp_offset=8, n_capture=1):
     torch.manual_seed(seed)
     eng.reset()
     eng.append_seed(seed_x4)
 
     # Settle: `settle` no-op frames. Reference view A = last RGB of the final 4-pack.
+    # Capture the last `n_capture` settle frames into the KV pin slots (round-robin), so
+    # the restamp arm can re-inject a multi-frame memory of the reference scene.
+    capture = pin_at_reference or arm in ("restamp", "restamp_pose")
     A = None
-    for spec in _noop(settle):
+    specs = _noop(settle)
+    for i, spec in enumerate(specs):
         A = eng.last_rgb(eng.gen(spec))
-
-    if pin_at_reference:
-        eng.pin_frame()  # Phase 3: persist the reference frame into pin slots
+        if capture and i >= settle - n_capture:
+            eng.pin_frame()
 
     if arm == "oracle":
         state = eng.get_state()
@@ -287,6 +299,29 @@ def run_trial(eng, seed_x4, seed, arm, K, settle, trajectory, pin_at_reference=F
             eng.gen(spec)
         eng.load_state(state)
         B = eng.last_rgb(eng.gen(NOOP))
+    elif arm == "restamp":
+        # Loop closure: identical revisit excursion, but during the pan-BACK phase the
+        # pinned keyframe is re-stamped to an in-distribution recent offset each step so
+        # the frozen attention can actually read it. Tests whether that closes the gap.
+        controls = build_controls("revisit", K, trajectory)
+        half = K // 2
+        B = None
+        for i, spec in enumerate(controls):
+            if i >= half:  # pan-back: bring the memory in-distribution before generating
+                eng.restamp_memory(restamp_offset)
+            B = eng.last_rgb(eng.gen(spec))
+    elif arm == "restamp_pose":
+        # Full pose restamp: same as restamp but also rotates the spatial (x/y) RoPE
+        # phase of the pinned key by the dead-reckoned camera yaw delta. This is the
+        # decisive experiment: does aligning the memory's spatial phase to the current
+        # camera heading close more of the revisit→oracle gap than time-only restamp?
+        controls = build_controls("revisit", K, trajectory)
+        half = K // 2
+        B = None
+        for i, spec in enumerate(controls):
+            if i >= half:  # pan-back: align memory pose (x,y,t) before generating
+                eng.restamp_memory(restamp_offset, align_pose=True)
+            B = eng.last_rgb(eng.gen(spec))
     else:  # still / revisit
         B = None
         for spec in build_controls(arm, K, trajectory):
@@ -309,11 +344,15 @@ def contact_sheet(A, B, path, scale=0.5):
 
 def sweep(args):
     device = "cpu" if args.self_test else args.device
+    arms = args.arms.split(",")
+    # Pins are needed to capture the reference keyframe for the restamp arm (or when
+    # explicitly pinning at reference). Allocated on global layers only by default.
+    need_pins = args.pin_at_reference or any(a in arms for a in ("restamp", "restamp_pose"))
     if args.self_test:
         eng = FakeEngine(horizon=16)
     else:
         eng = RealEngine(args.model, device, args.quant,
-                         args.pin_frames if args.pin_at_reference else 0,
+                         args.pin_frames if need_pins else 0,
                          pin_all_layers=args.pin_all_layers)
     lpips_fn = None if args.self_test or args.no_lpips else make_lpips(eng.device)
 
@@ -330,7 +369,6 @@ def sweep(args):
 
     seeds = load_seeds(args.n_scenes, args.assets, self_test=args.self_test)
     Ks = [int(k) for k in args.K.split(",")]
-    arms = args.arms.split(",")
 
     n_total = len(seeds) * args.seeds * len(Ks) * len(arms)
     done = 0
@@ -340,7 +378,9 @@ def sweep(args):
             for K in Ks:
                 for arm in arms:
                     A, B = run_trial(eng, seed_x4, seed, arm, K, args.settle,
-                                     args.trajectory, args.pin_at_reference)
+                                     args.trajectory, args.pin_at_reference,
+                                     restamp_offset=args.restamp_offset,
+                                     n_capture=min(args.pin_frames, args.settle))
                     p, sm = psnr(A, B), ssim(A, B)
                     lp = lpips_fn(A, B) if lpips_fn else ""
                     tag = f"{scene_name}_seed{seed}_{arm}_K{K}"
@@ -513,6 +553,10 @@ def main():
     ap.add_argument("--pin-frames", type=int, default=4, help="n_pin_frames when pinning")
     ap.add_argument("--pin-all-layers", action="store_true",
                     help="pin into local layers too (default: global layers only)")
+    ap.add_argument("--restamp-offset", type=int, default=8,
+                    help="restamp arm: in-distribution temporal offset (frames) to place "
+                         "the pinned keyframe behind the current query (default: 8 = one "
+                         "global dilation bucket)")
     # modes
     ap.add_argument("--self-test", action="store_true", help="CPU synthetic dry-run (no model)")
     ap.add_argument("--pilot", action="store_true", help="Phase 2a: validate camera-return trajectory")
