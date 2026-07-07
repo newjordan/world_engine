@@ -20,9 +20,14 @@
   re-expressed as a model sample. Durability channel, made legal.
 - `examples/warmstart.py` EXISTS (resume_index / renoise / partial_denoise /
   redream_step, same contract as rigid_step). Import-checked only — **never run on GPU**.
-- You write: `examples/test_warmstart.py` (CPU; test list in the plan) and
-  `examples/warm_probe.py` (adapt rigid_probe.py; arms table + decision rules in the plan).
-- Pilot before sweeping: `--arms revisit,redream,redream_nowb --n-scenes 1 --seeds 1`.
+- `examples/test_warmstart.py` and `examples/warm_probe.py` now exist, uncommitted
+  on top of `4b41fce`. CPU checks passed:
+  `uv run --dev pytest examples/test_warmstart.py -v` and
+  `uv run --dev pytest examples/test_rigid.py examples/test_graybox.py -q`.
+- GPU pilot is still NOT run. Last checked GPU had an active `VLLM::EngineCore`
+  process using ~58 GB, so the safe resume point is the pilot:
+  `uv run --dev python examples/warm_probe.py --arms revisit,redream,redream_nowb --n-scenes 1 --seeds 1 --csv bench_out/warm/pilot.csv`.
+  The runner prints condition/source hashes and writes dx/provenance rows by default.
   Then the 7-arm tuned sweep (`--M 1 --restamp-offset 4`), 2 scenes × 3 seeds,
   CSVs → `bench_out/warm/`.
 - **The fingerprint is the per-frame dx curve**: bounded ⇒ laundering restored

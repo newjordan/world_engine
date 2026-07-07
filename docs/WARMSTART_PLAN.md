@@ -1,8 +1,9 @@
 # Phase 9 plan — Warmstart / Re-dream: laundered memory write-back
 
-**Status: PLAN + untested module.** `examples/warmstart.py` is written and import-checked
-(pure helpers sanity-verified on CPU); **no GPU run has happened**. This doc is the
-handoff spec for the agent that runs it.
+**Status: runner ready, GPU untested.** `examples/warmstart.py` is written and
+import-checked. `examples/test_warmstart.py` and `examples/warm_probe.py` have been
+added on top of commit `4b41fce`; CPU tests pass, but **no GPU run has happened**.
+This doc is the handoff spec for the agent that runs it.
 
 **Branch:** `spin-persistence` · **Prereqs:** docs/RIGID_RESULTS.md (Phase 8),
 docs/SPIN_RESULTS.md §next-steps (warmstart endorsement), examples/rigid.py.
@@ -65,7 +66,9 @@ from rigid.py so test_rigid.py already covers them):
   scoring the re-dreamed decode (isolates the init/overlay component, exactly as
   `rigid_nowb` isolated the paste).
 
-**Not written yet:** `examples/test_warmstart.py`, `examples/warm_probe.py`.
+`examples/test_warmstart.py` implements the CPU test plan below. `examples/warm_probe.py`
+implements the tuned arm table, prints condition/source hashes at startup, and writes
+per-frame `dx_px` plus `sigma_re` rows to CSV for the decisive fingerprint.
 
 ## Experiment design (warm_probe.py — adapt rigid_probe.py, ~30 min of editing)
 
