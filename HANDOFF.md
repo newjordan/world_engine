@@ -2,6 +2,11 @@
 
 Read `docs/HANDOFF_REPORT_2026-07-07.md` first. It is the full current handoff report.
 
+**Forward plan:** `docs/NORTHSTAR.md` is the long-horizon goal sheet — Phase 10+
+queue (front-door `append_frame` anchoring first), the Permanence Gauntlet
+benchmark, live-demo milestone, the CARTOGRAPHER game concept, and operating
+rules for long-running agents. Start there for anything beyond Phase 9.
+
 ## Current State
 
 - Branch: `spin-persistence`
