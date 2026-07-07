@@ -1,9 +1,9 @@
 # Phase 9 plan — Warmstart / Re-dream: laundered memory write-back
 
 **Status: runner ready, GPU untested.** `examples/warmstart.py` is written and
-import-checked. `examples/test_warmstart.py` and `examples/warm_probe.py` have been
-added on top of commit `4b41fce`; CPU tests pass, but **no GPU run has happened**.
-This doc is the handoff spec for the agent that runs it.
+import-checked. `examples/test_warmstart.py` and `examples/warm_probe.py` are committed
+at `95ab61d`; CPU tests pass, but **no GPU run has happened**. This doc is the handoff
+spec for the agent that runs it.
 
 **Branch:** `spin-persistence` · **Prereqs:** docs/RIGID_RESULTS.md (Phase 8),
 docs/SPIN_RESULTS.md §next-steps (warmstart endorsement), examples/rigid.py.
@@ -70,7 +70,7 @@ from rigid.py so test_rigid.py already covers them):
 implements the tuned arm table, prints condition/source hashes at startup, and writes
 per-frame `dx_px` plus `sigma_re` rows to CSV for the decisive fingerprint.
 
-## Experiment design (warm_probe.py — adapt rigid_probe.py, ~30 min of editing)
+## Experiment design (`examples/warm_probe.py`)
 
 Same return-to-start hysteresis, **tuned settings**: K=64, settle 8, yaw_mag 0.2,
 `--M 1 --restamp-offset 4`, 2 scenes × 3 seeds, paired per-trial stats, hard regime
@@ -108,6 +108,79 @@ Runtime: redream arms ≈ 1.6–2× a plain frame (4-step propose + 1–2 step r
 second decode). Pilot first: `--arms revisit,redream,redream_nowb --n-scenes 1
 --seeds 1` and eyeball accept rate (expect ~100% like atlas_nowb) and timing before
 the 7-arm sweep.
+
+## Runbook
+
+Condition source: this file. Run label: `new_experiment` until a GPU pilot or sweep
+has actually completed and written `bench_out/warm/*.csv`.
+
+Do not launch if the GPU is already carrying another large model. The last check before
+the runner commit found an active `VLLM::EngineCore` process using about 58 GB, so the
+pilot was intentionally not run.
+
+1. Pilot, minimal claim surface:
+
+       uv run --dev python examples/warm_probe.py \
+         --arms revisit,redream,redream_nowb \
+         --n-scenes 1 --seeds 1 \
+         --csv bench_out/warm/pilot.csv
+
+2. If the pilot starts cleanly, writes CSV rows, and has sane accept/timing, run the
+   tuned Phase 9 sweep:
+
+       uv run --dev python examples/warm_probe.py \
+         --arms revisit,atlas,atlas_nowb,redream,redream_nowb,redream_far,atlas_redream \
+         --M 1 --restamp-offset 4 \
+         --n-scenes 2 --seeds 3 \
+         --csv bench_out/warm/warm.csv
+
+3. Only add `redream75` after the σ=0.3 result is interpretable:
+
+       uv run --dev python examples/warm_probe.py \
+         --arms revisit,redream,redream_nowb,redream75 \
+         --n-scenes 2 --seeds 3 \
+         --csv bench_out/warm/redream75.csv
+
+The runner prints the command, source hashes, scheduler grid, model, seeds, arms,
+and metric at startup. Save stdout beside the CSV with `tee` when doing a decisive
+run; the CSV alone is enough for metrics, but the log carries the resolved condition.
+
+## CSV and analysis contract
+
+`warm_probe.py` writes one scored pan-back row per `(scene, seed, arm, back_idx)`:
+
+    scene,seed,arm,back_idx,heading,psnr,ssim,projected,dx_px,resp,reject,wb,sigma_re
+
+- `back_idx`: pan-back frame order, starting at 0. Use this for the dx fingerprint.
+- `heading`: matched outbound heading used for the PSNR/SSIM reference.
+- `projected`: redream/overlay accepted registration for the scored frame.
+- `dx_px`: appearance registration shift in full-resolution pixels.
+- `resp`: phase-correlation response. A high response with growing `dx_px` is exactly
+  the Phase 8 runaway signature; do not dismiss it as a gate miss.
+- `reject`: empty, `resp`, or `shift`.
+- `wb`: whether the arm wrote the redreamed/projected latent back to KV.
+- `sigma_re`: actual grid sigma used by redream, empty for non-redream arms.
+
+Primary plots/tables to make after a run:
+
+- per-trial hard-regime paired deltas:
+  `redream - redream_nowb`, `redream_nowb - revisit`, `redream - redream_far`,
+  `atlas_redream - atlas`, and `atlas_nowb - atlas`.
+- mean `abs(dx_px)` vs `back_idx` for `redream`, `redream_nowb`, and if present
+  Phase 8 `bench_out/rigid/diag.csv`.
+- accept/wrote-back/reject rates by arm.
+
+Result language is constrained by provenance:
+
+- If only the pilot ran, call it a pilot and do not claim a Phase 9 result.
+- If `redream - redream_nowb` is positive and `dx_px` remains bounded, the result is
+  "laundered write-back restored the durability channel" and the next run is the
+  triple-stack record attempt.
+- If `redream - redream_nowb` is negative and `dx_px` grows like Phase 8, the result is
+  "on-manifold memory-bearing context still stalls dynamics" and the next doc should
+  frame this as training-side evidence, not an inference-side tuning failure.
+- If `redream_nowb - revisit` is weak, do not interpret write-back yet; first inspect
+  whether σ=0.3 washed out the memory band or whether registration was rejected.
 
 ## Test plan (test_warmstart.py, CPU, no model)
 

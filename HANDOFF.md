@@ -3,7 +3,8 @@
 ## State
 - **Branch `spin-persistence`.** Phase 8 committed at `2b97dbc` (graybox + rigid: write-back
   cascade diagnosed and killed; **tuned atlas + output overlay = +3.40 dB, 6/6 — inference-side
-  record, 2× Phase 6**). Phase 9 is a PLAN + untested module, committed on top. Not pushed.
+  record, 2× Phase 6**). Phase 9 runner/tests are committed at `95ab61d` on top.
+  Not pushed.
 - CPU tests green through Phase 8: `uv run --dev pytest examples/test_rigid.py examples/test_graybox.py`
   (14 + graybox), plus the Phase ≤7 suites.
 - Shareable results page (Phase 8 drill-down, charts from raw CSVs):
@@ -20,8 +21,7 @@
   re-expressed as a model sample. Durability channel, made legal.
 - `examples/warmstart.py` EXISTS (resume_index / renoise / partial_denoise /
   redream_step, same contract as rigid_step). Import-checked only — **never run on GPU**.
-- `examples/test_warmstart.py` and `examples/warm_probe.py` now exist, uncommitted
-  on top of `4b41fce`. CPU checks passed:
+- `examples/test_warmstart.py` and `examples/warm_probe.py` now exist. CPU checks passed:
   `uv run --dev pytest examples/test_warmstart.py -v` and
   `uv run --dev pytest examples/test_rigid.py examples/test_graybox.py -q`.
 - GPU pilot is still NOT run. Last checked GPU had an active `VLLM::EngineCore`
