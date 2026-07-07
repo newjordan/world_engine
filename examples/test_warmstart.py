@@ -25,6 +25,12 @@ def test_resume_index_snaps_within_tolerance():
     assert resume_index(sigmas, 0.2999999) == 3
 
 
+def test_resume_index_snaps_dtype_rounded_live_grid():
+    sigmas = [1.0, 0.8984375, 0.75, 0.30078125, 0.0]
+    assert resume_index(sigmas, 0.9) == 1
+    assert resume_index(sigmas, 0.3) == 3
+
+
 @pytest.mark.parametrize("sigma", [0.2, 0.31, 0.5, 0.8])
 def test_resume_index_rejects_off_grid_sigma(sigma):
     sigmas = [1.0, 0.9, 0.75, 0.3, 0.0]

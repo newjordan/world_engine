@@ -57,12 +57,13 @@ from rigid import RigidStore, register, valid_cols                 # noqa: E402
 # --------------------------------------------------------------------------- #
 # pure schedule / renoise math (CPU, model-free)
 # --------------------------------------------------------------------------- #
-def resume_index(sigmas, s: float, tol: float = 1e-4) -> int:
+def resume_index(sigmas, s: float, tol: float = 2e-3) -> int:
     """Index j of the grid sigma the re-dream resumes from. `s` must be a mid-schedule
     grid value: strictly inside (0, sigmas[0]) — resuming from sigmas[0] would discard
     the proposal entirely and from 0.0 there is nothing left to run. Snaps to the
-    nearest grid sigma; raises if `s` is not on the grid (the model was only ever
-    sampled at grid sigmas — an off-grid renoise level is a silent OOD input)."""
+    nearest grid sigma, allowing dtype-rounded live grids such as bf16 0.30078125 for
+    requested 0.3; raises if `s` is not on the grid (the model was only ever sampled
+    at grid sigmas — an off-grid renoise level is a silent OOD input)."""
     vals = [float(v) for v in sigmas]
     j = min(range(len(vals)), key=lambda i: abs(vals[i] - s))
     if abs(vals[j] - s) > tol:

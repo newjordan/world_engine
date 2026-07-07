@@ -38,10 +38,11 @@ persistence cannot be bolted on at inference.
 
 ## Engine facts the implementation relies on (verified this session)
 
-- `scheduler_sigmas = [1.0, 0.9, 0.75, 0.3, 0.0]` (model config.yaml). The doc-endorsed
-  renoise levels σ∈{0.3, 0.75} are **exact grid points**: s=0.3 → 1 Euler step,
-  s=0.75 → 2 steps. Off-grid sigmas are rejected (`resume_index` raises) — the model
-  never saw them.
+- Config scheduler grid is `[1.0, 0.9, 0.75, 0.3, 0.0]`; the live engine stores it
+  in model dtype, so on bf16 it resolves to `[1.0, 0.8984375, 0.75, 0.30078125, 0.0]`.
+  The doc-endorsed renoise levels σ∈{0.3, 0.75} are still **grid points** after dtype
+  snapping: s≈0.3 → 1 Euler step, s=0.75 → 2 steps. Off-grid sigmas are rejected
+  (`resume_index` raises) — the model never saw them.
 - Flow convention (from `world_engine._denoise_pass`): x starts at pure noise σ=1,
   Euler `x += dσ·v` down the grid ⇒ forward map is `x_s = (1−s)·x0 + s·ε`.
 - `_denoise_pass` is fullgraph-compiled and always starts at σ=1; the re-dream tail
