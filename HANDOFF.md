@@ -3,8 +3,9 @@
 ## State
 - **Branch `spin-persistence`.** Phase 8 committed at `2b97dbc` (graybox + rigid: write-back
   cascade diagnosed and killed; **tuned atlas + output overlay = +3.40 dB, 6/6 — inference-side
-  record, 2× Phase 6**). Phase 9 runner/tests are committed at `95ab61d` on top.
-  Not pushed.
+  record, 2× Phase 6**). Phase 9 runner/tests are committed; scheduler snap fix at
+  `3338c8e`. Phase 9 controlled sweep ran and is documented in
+  `docs/WARMSTART_RESULTS.md`. Not pushed.
 - CPU tests green through Phase 8: `uv run --dev pytest examples/test_rigid.py examples/test_graybox.py`
   (14 + graybox), plus the Phase ≤7 suites.
 - Shareable results page (Phase 8 drill-down, charts from raw CSVs):
@@ -24,16 +25,13 @@
 - `examples/test_warmstart.py` and `examples/warm_probe.py` now exist. CPU checks passed:
   `uv run --dev pytest examples/test_warmstart.py -v` and
   `uv run --dev pytest examples/test_rigid.py examples/test_graybox.py -q`.
-- GPU pilot is still NOT run. Last checked GPU had an active `VLLM::EngineCore`
-  process using ~58 GB, so the safe resume point is the pilot:
-  `uv run --dev python examples/warm_probe.py --arms revisit,redream,redream_nowb --n-scenes 1 --seeds 1 --csv bench_out/warm/pilot.csv`.
-  The runner prints condition/source hashes and writes dx/provenance rows by default.
-  Then the 7-arm tuned sweep (`--M 1 --restamp-offset 4`), 2 scenes × 3 seeds,
-  CSVs → `bench_out/warm/`.
-- **The fingerprint is the per-frame dx curve**: bounded ⇒ laundering restored
-  durability (then go for the triple-stack record); monotone growth like
-  bench_out/rigid/diag.csv ⇒ even on-manifold edits stall dynamics ⇒ write it up as
-  the strongest training-side evidence yet. Either outcome is a publishable result.
+- GPU sweep complete: `bench_out/warm/warm.csv`, `bench_out/warm/warm.log`,
+  `bench_out/warm/index.html`, `bench_out/warm/summary.json`.
+- Result: `redream - redream_nowb = -4.28 ± 1.63 dB` (0/6), write-back |dx| 130 px
+  vs 17 px without write-back. Laundered write-back does **not** restore durability.
+  Even on-manifold memory-bearing context edits stall dynamics.
+- Stop rule: do not keep launching sigma-0.3 laundered write-back or simple dose tweaks
+  as if they are new evidence. `redream75` is a diagnostic only if explicitly requested.
 
 ## What Phase 8 established (details: docs/RIGID_RESULTS.md)
 1. Write-back is the whole disease: rigid −1.34 (0/6) vs rigid_nowb +0.45 (6/6); |dx|

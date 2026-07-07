@@ -1,9 +1,8 @@
 # Phase 9 plan — Warmstart / Re-dream: laundered memory write-back
 
-**Status: runner ready, GPU untested.** `examples/warmstart.py` is written and
-import-checked. `examples/test_warmstart.py` and `examples/warm_probe.py` are committed
-at `95ab61d`; CPU tests pass, but **no GPU run has happened**. This doc is the handoff
-spec for the agent that runs it.
+**Status: controlled sweep complete.** `examples/warmstart.py`, `examples/warm_probe.py`,
+and `examples/test_warmstart.py` are committed. The tuned GPU sweep ran on 2026-07-07;
+see `docs/WARMSTART_RESULTS.md`. Laundered write-back failed the durability test.
 
 **Branch:** `spin-persistence` · **Prereqs:** docs/RIGID_RESULTS.md (Phase 8),
 docs/SPIN_RESULTS.md §next-steps (warmstart endorsement), examples/rigid.py.
@@ -112,8 +111,8 @@ the 7-arm sweep.
 
 ## Runbook
 
-Condition source: this file. Run label: `new_experiment` until a GPU pilot or sweep
-has actually completed and written `bench_out/warm/*.csv`.
+Condition source: this file. Historical run label for the 2026-07-07 sweep:
+`new_experiment`, now completed and summarized in `docs/WARMSTART_RESULTS.md`.
 
 Do not launch if the GPU is already carrying another large model. The last check before
 the runner commit found an active `VLLM::EngineCore` process using about 58 GB, so the
@@ -135,7 +134,9 @@ pilot was intentionally not run.
          --n-scenes 2 --seeds 3 \
          --csv bench_out/warm/warm.csv
 
-3. Only add `redream75` after the σ=0.3 result is interpretable:
+3. Do not add `redream75` as routine follow-up after the completed σ≈0.3 failure.
+   It is a dose tweak in the same representation class, not a new durability mechanism.
+   Run it only if explicitly requested as a diagnostic:
 
        uv run --dev python examples/warm_probe.py \
          --arms revisit,redream,redream_nowb,redream75 \
