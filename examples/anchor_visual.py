@@ -29,7 +29,10 @@ from permanence_bench import RealEngine, _noop, load_seeds, psnr, ssim
 from rigid import RigidStore, band_mask, rigid_step
 
 
-ANCHOR_ARMS = {"anchor", "anchor_blend", "anchor_k1", "anchor_k4"}
+ANCHOR_ARMS = {
+    "anchor", "anchor_blend", "anchor_k1", "anchor_k4",
+    "anchor_full", "anchor_full_blend", "anchor_confmap", "anchor_full_far",
+}
 ATLAS_ARMS = {"atlas_nowb"}
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 
@@ -50,8 +53,20 @@ def _cadence(arm):
     return None
 
 
+def _retrieve_mode(arm):
+    return "farthest" if arm.endswith("_far") else "nearest"
+
+
+def _mask_mode(arm):
+    if arm.startswith("anchor_full"):
+        return "full"
+    if arm == "anchor_confmap":
+        return "confmap"
+    return "band"
+
+
 def _append_anchor(eng, store, current_rgb, arm, args, anchor_count):
-    kf = store.query(float(eng.engine.camera_yaw), mode="nearest")
+    kf = store.query(float(eng.engine.camera_yaw), mode=_retrieve_mode(arm))
     info = {"projected": False, "dx_px": None, "resp": None, "reject": "empty",
             "anchor": False, "alpha": 0.0, "anchor_count": anchor_count}
     if kf is None:
@@ -62,13 +77,14 @@ def _append_anchor(eng, store, current_rgb, arm, args, anchor_count):
         resp_min=args.resp_min,
         max_shift_frac=args.max_shift_frac,
         feather=args.pixel_feather,
+        mask_mode=_mask_mode(arm),
     )
     if not info["projected"]:
         info.update(anchor=False, alpha=0.0, anchor_count=anchor_count)
         return current_rgb, info
 
     alpha = 1.0
-    if arm == "anchor_blend":
+    if arm in ("anchor_blend", "anchor_full_blend"):
         alpha = confidence_alpha(info.get("resp"), args.resp_min, args.resp_full)
         recon = blend_u8(recon, current_rgb, alpha)
 
@@ -283,7 +299,7 @@ def html_page(out_dir, cases, manifest, aggregate_rows):
 <section>
   <h2>{html.escape(case['label'])}</h2>
   <p class="boundary">Controlled visual rerun: scene <code>{html.escape(scene)}</code>,
-  seed <code>{seed}</code>. The aggregate n=6 result remains <code>anchor.csv</code>;
+  seed <code>{seed}</code>. The aggregate n=6 result remains the linked CSV;
   this sheet exists so the failure/success modes are visually inspectable.</p>
   <a href="{slug}/contact_sheet.png"><img class="sheet" src="{slug}/contact_sheet.png"></a>
   <table>
@@ -295,7 +311,7 @@ def html_page(out_dir, cases, manifest, aggregate_rows):
 
     doc = f"""<!doctype html>
 <meta charset="utf-8">
-<title>Phase 10 Visual Review</title>
+<title>Anchor Visual Review</title>
 <style>
 body {{ font-family: system-ui, sans-serif; margin: 28px; color: #111827; }}
 h1 {{ margin-bottom: 6px; }}
@@ -308,15 +324,14 @@ th {{ background: #e5edf6; }}
 code {{ background: #eef2f7; padding: 1px 4px; }}
 a {{ color: #1d4ed8; }}
 </style>
-<h1>Phase 10 Visual Review</h1>
+<h1>Anchor Visual Review</h1>
 <p class="boundary">Frames-first review packet from controlled reruns of selected
 Phase 10 trials. These are real generated frames from <code>examples/anchor_visual.py</code>.
 They are visual explanations, not a replacement for the n=6 aggregate CSV.</p>
 <p>
-Raw aggregate: <a href="../anchor.csv">anchor.csv</a> |
-Aggregate log: <a href="../anchor.log">anchor.log</a> |
+Raw aggregate: <a href="{html.escape(os.path.relpath(manifest['aggregate_csv'], out_dir))}">{html.escape(os.path.basename(manifest['aggregate_csv']))}</a> |
 Visual manifest: <a href="manifest.json">manifest.json</a> |
-Numeric report: <a href="../report/index.html">metric report</a>
+Condition source: <code>{html.escape(manifest['condition_source'])}</code>
 </p>
 {''.join(cards)}
 <h2>Provenance</h2>
@@ -342,6 +357,7 @@ def main():
     ap.add_argument("--model", default="Overworld/Waypoint-1.5-1B")
     ap.add_argument("--out", default="bench_out/anchor/visual_review")
     ap.add_argument("--aggregate-csv", default="bench_out/anchor/anchor.csv")
+    ap.add_argument("--condition-source", default="docs/ANCHOR_PLAN.md")
     ap.add_argument("--cases", default="seed_01:1235:anchor_k4_good,seed_00:1234:anchor_k4_bad")
     ap.add_argument("--arms", default="revisit,atlas_nowb,anchor,anchor_k4")
     ap.add_argument("--K", type=int, default=64)
@@ -365,14 +381,14 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     cases = parse_cases(args.cases)
     arms = [a.strip() for a in args.arms.split(",") if a.strip()]
-    print("Condition source: docs/ANCHOR_PLAN.md")
+    print(f"Condition source: {args.condition_source}")
     print("Run label: visual_review")
     print(f"Command: {shlex.join(sys.argv)}")
     print("Source hashes: "
           f"anchor_visual={_sha256(__file__)} "
           f"anchor={_sha256('examples/anchor.py')} "
           f"anchor_probe={_sha256('examples/anchor_probe.py')} "
-          f"plan={_sha256('docs/ANCHOR_PLAN.md')}")
+          f"plan={_sha256(args.condition_source)}")
 
     eng = RealEngine(args.model, "cuda", args.quant, max(args.atlas_k, 1),
                      pin_all_layers=True)
@@ -385,7 +401,7 @@ def main():
           f"scheduler_sigmas={sigmas} arms={arms} cases={args.cases}", flush=True)
 
     manifest = {
-        "condition_source": "docs/ANCHOR_PLAN.md",
+        "condition_source": args.condition_source,
         "run_label": "visual_review",
         "command": shlex.join(sys.argv),
         "model": args.model,
@@ -399,7 +415,7 @@ def main():
             "anchor_visual": _sha256(__file__),
             "anchor": _sha256("examples/anchor.py"),
             "anchor_probe": _sha256("examples/anchor_probe.py"),
-            "plan": _sha256("docs/ANCHOR_PLAN.md"),
+            "plan": _sha256(args.condition_source),
         },
     }
 
