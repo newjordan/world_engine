@@ -1,9 +1,13 @@
 # Handoff - spin-persistence - 2026-07-07
 
-Read `docs/HANDOFF_REPORT_2026-07-07.md` first. It is the full current handoff report.
+Read `docs/HANDOFF_PUSH_BOUNDARY_2026-07-08.md` first. It is the current
+stop-state and next-boundary handoff. Then read `docs/ANCHOR_RESULTS.md` for the
+latest controlled result, then `docs/HANDOFF_REPORT_2026-07-07.md` for the Phase 9
+handoff context.
 
-**Forward plan:** `docs/NORTHSTAR.md` is the long-horizon goal sheet — Phase 10+
-queue (front-door `append_frame` anchoring first), the Permanence Gauntlet
+**Forward plan:** `docs/NORTHSTAR.md` is the long-horizon goal sheet. Phase 10
+front-door anchoring has now run and failed the true-durability gate; next queue
+items are the Permanence Gauntlet
 benchmark, live-demo milestone, the CARTOGRAPHER game concept, and operating
 rules for long-running agents. Start there for anything beyond Phase 9.
 
@@ -17,6 +21,9 @@ rules for long-running agents. Start there for anything beyond Phase 9.
 - Phase 8: rigid write-back failure diagnosed; tuned atlas plus no-write-back overlay set
   the inference-side record at `+3.40 +/- 0.91 dB`, 6/6.
 - Phase 9: warmstart / re-dream controlled sweep completed; laundered write-back failed.
+- Phase 10: front-door `append_frame` anchoring controlled sweep completed;
+  no variant passed the true-durability gate. `anchor_k4` is the best product-side
+  cadence signal but still lost to `atlas_nowb` at post16 on average.
 - Online local review report, while server is alive:
   `http://192.168.1.176:8767/report/index.html`
 - Tailnet report:
@@ -41,12 +48,36 @@ Stop rule: do not keep launching sigma-0.3 laundered write-back or simple dose t
 as if they are new evidence. `redream75` is only a user-requested diagnostic, not a new
 representation.
 
+## Phase 10 Verdict
+
+Primary controlled sweep, n=6:
+
+| comparison | delta PSNR | wins |
+|---|---:|---:|
+| `atlas_nowb - revisit` hard-regime canary | `+3.47 +/- 1.00 dB` | `6/6` |
+| `anchor - atlas_nowb` at post16 | `-0.78 +/- 1.11 dB` | `1/6` |
+| `anchor_blend - atlas_nowb` at post16 | `-1.10 +/- 0.70 dB` | `0/6` |
+| `anchor_k1 - atlas_nowb` at post16 | `-0.75 +/- 0.40 dB` | `0/6` |
+| `anchor_k4 - atlas_nowb` at post16 | `-0.51 +/- 1.46 dB` | `3/6` |
+
+Interpretation: appending a registered RGB atlas reconstruction through the VAE
+front door did not repair the model's own continuation enough to count as true
+durability. `anchor_k4` kept a healthy mean dx (`13.3 px`) and may be useful for
+product cadence, but Phase 10 is a scientific fail under the stated gate.
+
 ## Artifacts
 
 - Full handoff: `docs/HANDOFF_REPORT_2026-07-07.md`
 - Phase 9 result doc: `docs/WARMSTART_RESULTS.md`
 - Phase 9 plan/runbook: `docs/WARMSTART_PLAN.md`
 - Phase 8 comparator: `docs/RIGID_RESULTS.md`
+- Phase 10 result doc: `docs/ANCHOR_RESULTS.md`
+- Phase 10 plan/runbook: `docs/ANCHOR_PLAN.md`
+- Phase 10 raw CSV/log/report: `bench_out/anchor/anchor.csv`,
+  `bench_out/anchor/anchor.log`, `bench_out/anchor/report/index.html`
+- Phase 10 frames-first visual review: `bench_out/anchor/visual_review/index.html`
+  with raw PNGs/contact sheets for selected controlled reruns.
+- Current boundary-pushing handoff: `docs/HANDOFF_PUSH_BOUNDARY_2026-07-08.md`
 - Phase 9 metrics page: `bench_out/warm/index.html`
 - Online report page: `bench_out/warm/report/index.html`
 - Phase 9 raw CSV/log/summary: `bench_out/warm/warm.csv`, `bench_out/warm/warm.log`,
