@@ -152,6 +152,44 @@ def test_reconstruct_temporal_batch_uses_distinct_micro_frames():
         assert after < 1.0
 
 
+def test_reconstruct_temporal_batch_full_mode_replaces_outside_band():
+    base = np.stack([_tex(seed=i + 10, h=120, w=240) for i in range(4)], axis=0)
+    current = np.stack([shift_rgb_x(frame, 7.0) for frame in base], axis=0)
+    band = pixel_band_mask(base.shape[1], base.shape[2], feather=0)[..., 0].astype(bool)
+    damaged = current.copy()
+    damaged[:, ~band] = 0
+    s = AnchorStore()
+    assert s.insert(base, yaw=1.0, yaw_delta=0.4)
+    target_yaws = micro_yaw_grid(1.0, 0.4, n=4)
+    recon, infos = reconstruct_temporal_batch(
+        s, damaged, target_yaws, feather=0, resp_min=0.02, mask_mode="full")
+    assert all(i["projected"] for i in infos), infos
+    outside = ~band
+    for j, info in enumerate(infos):
+        mem_shifted = shift_rgb_x(base[j], info["dx_px"])
+        before = np.mean(np.abs(damaged[j][outside].astype(float) - mem_shifted[outside].astype(float)))
+        err = np.mean(np.abs(recon[j][outside].astype(float) - mem_shifted[outside].astype(float)))
+        assert err < before * 0.1
+
+
+def test_reconstruct_temporal_batch_honors_farthest_retrieval():
+    near = np.stack([_tex(seed=i + 20, h=120, w=240) for i in range(4)], axis=0)
+    far = np.stack([_tex(seed=i + 30, h=120, w=240) for i in range(4)], axis=0)
+    current = np.stack([shift_rgb_x(frame, 7.0) for frame in near], axis=0)
+    s = AnchorStore(tau_insert=0.01)
+    assert s.insert(near, yaw=0.0, yaw_delta=0.0)
+    assert s.insert(far, yaw=10.0, yaw_delta=0.0)
+    target_yaws = [0.0, 0.0, 0.0, 0.0]
+
+    _near_recon, near_infos = reconstruct_temporal_batch(
+        s, current, target_yaws, retrieve="nearest", feather=0, resp_min=0.02)
+    _far_recon, far_infos = reconstruct_temporal_batch(
+        s, current, target_yaws, retrieve="farthest", feather=0, resp_min=0.02)
+
+    assert {i["kf_seq"] for i in near_infos} == {0}
+    assert {i["kf_seq"] for i in far_infos} == {1}
+
+
 def test_reconstruct_temporal_batch_empty_store_falls_back_to_current():
     current = np.stack([_tex(seed=i, h=20, w=40) for i in range(4)], axis=0)
     recon, infos = reconstruct_temporal_batch(AnchorStore(), current, [0.0, 0.0, 0.0, 0.0])

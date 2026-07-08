@@ -22,8 +22,9 @@ import cv2
 import numpy as np
 import torch
 
-from anchor import (AnchorStore, blend_u8, confidence_alpha,
-                    reconstruct_from_keyframe, repeat_as_x4)
+from anchor import (AnchorStore, blend_u8, confidence_alpha, micro_yaw_grid,
+                    reconstruct_from_keyframe, reconstruct_temporal_batch,
+                    repeat_as_x4)
 from atlas import AtlasStore, _clear_pins
 from permanence_bench import RealEngine, _noop, load_seeds, psnr, ssim
 from rigid import RigidStore, band_mask, rigid_step
@@ -31,7 +32,9 @@ from rigid import RigidStore, band_mask, rigid_step
 
 ANCHOR_ARMS = {
     "anchor", "anchor_blend", "anchor_k1", "anchor_k4",
+    "anchor4_linear", "anchor4_blend", "anchor4_k4",
     "anchor_full", "anchor_full_blend", "anchor_confmap", "anchor_full_far",
+    "anchor4_full", "anchor4_full_blend", "anchor4_full_far",
 }
 ATLAS_ARMS = {"atlas_nowb"}
 FONT = cv2.FONT_HERSHEY_SIMPLEX
@@ -48,9 +51,13 @@ def _sha256(path):
 def _cadence(arm):
     if arm == "anchor_k1":
         return 1
-    if arm == "anchor_k4":
+    if arm in ("anchor_k4", "anchor4_k4"):
         return 4
     return None
+
+
+def _is_anchor4(arm):
+    return arm.startswith("anchor4_")
 
 
 def _retrieve_mode(arm):
@@ -58,19 +65,65 @@ def _retrieve_mode(arm):
 
 
 def _mask_mode(arm):
-    if arm.startswith("anchor_full"):
+    if arm.startswith("anchor_full") or arm.startswith("anchor4_full"):
         return "full"
     if arm == "anchor_confmap":
         return "confmap"
     return "band"
 
 
-def _append_anchor(eng, store, current_rgb, arm, args, anchor_count):
+def _summarize_micro_infos(micro_infos, anchor_count):
+    projected = [i for i in micro_infos if i.get("projected")]
+    resp = [i["resp"] for i in micro_infos if i.get("resp") is not None]
+    alpha = [i.get("alpha", 0.0) for i in projected]
+    all_projected = len(projected) == len(micro_infos)
+    return {
+        "projected": bool(projected),
+        "dx_px": float(np.mean([i["dx_px"] for i in projected])) if projected else None,
+        "resp": float(np.mean(resp)) if resp else None,
+        "reject": None if all_projected else ("empty" if not projected else "partial"),
+        "anchor": bool(projected),
+        "alpha": float(np.mean(alpha)) if alpha else 0.0,
+        "anchor_count": anchor_count,
+        "micro_infos": micro_infos,
+    }
+
+
+def _append_anchor(eng, store, current_rgb, arm, args, anchor_count,
+                   current_x4=None, target_yaws=None):
     kf = store.query(float(eng.engine.camera_yaw), mode=_retrieve_mode(arm))
     info = {"projected": False, "dx_px": None, "resp": None, "reject": "empty",
             "anchor": False, "alpha": 0.0, "anchor_count": anchor_count}
     if kf is None:
         return current_rgb, info
+
+    if _is_anchor4(arm):
+        if current_x4 is None:
+            current_x4 = repeat_as_x4(current_rgb)
+        if target_yaws is None:
+            target_yaws = [float(eng.engine.camera_yaw)] * len(current_x4)
+        recon_x4, micro_infos = reconstruct_temporal_batch(
+            store, current_x4, target_yaws,
+            retrieve=_retrieve_mode(arm),
+            blend=(arm in ("anchor4_blend", "anchor4_full_blend")),
+            resp_min=args.resp_min,
+            resp_full=args.resp_full,
+            max_shift_frac=args.max_shift_frac,
+            feather=args.pixel_feather,
+            mask_mode=_mask_mode(arm),
+        )
+        if not any(i.get("projected") for i in micro_infos):
+            info = _summarize_micro_infos(micro_infos, anchor_count)
+            info.update(anchor=False)
+            return current_rgb, info
+
+        ctrl = eng._CtrlInput(button=set(), mouse=(0.0, 0.0))
+        four = eng.engine.append_frame(torch.from_numpy(recon_x4).to(eng.device), ctrl=ctrl)
+        appended = eng.last_rgb(four)
+        anchor_count += 1
+        info = _summarize_micro_infos(micro_infos, anchor_count)
+        info.update(anchor=True)
+        return appended, info
 
     recon, info = reconstruct_from_keyframe(
         kf, current_rgb,
@@ -131,24 +184,33 @@ def run_arm(eng, seed_x4, seed, arm, args):
         return four, info
 
     start = None
+    last_yaw_delta = 0.0
     for i, _spec in enumerate(_noop(args.settle)):
+        yaw_before = float(eng.engine.camera_yaw)
         if is_atlas:
             four, _info = gen_atlas_nowb((0.0, 0.0), capture=(i == args.settle - 1))
         else:
             four = gen_plain((0.0, 0.0))
+        yaw_after = float(eng.engine.camera_yaw)
+        last_yaw_delta = yaw_after - yaw_before
         start = eng.last_rgb(four)
     if is_anchor:
-        anchor_store.insert(eng.all_rgb(four), float(eng.engine.camera_yaw))
+        anchor_store.insert(eng.all_rgb(four), float(eng.engine.camera_yaw),
+                            yaw_delta=last_yaw_delta)
     if is_atlas:
         eng.atlas_capture()
 
     for i in range(H):
+        yaw_before = float(eng.engine.camera_yaw)
         if is_atlas:
             four, _info = gen_atlas_nowb((+args.yaw_mag, 0.0), capture=(i % args.M == 0))
         else:
             four = gen_plain((+args.yaw_mag, 0.0))
+        yaw_after = float(eng.engine.camera_yaw)
+        yaw_delta = yaw_after - yaw_before
         if is_anchor and i % args.M == 0:
-            anchor_store.insert(eng.all_rgb(four), float(eng.engine.camera_yaw))
+            anchor_store.insert(eng.all_rgb(four), float(eng.engine.camera_yaw),
+                                yaw_delta=yaw_delta)
         if is_atlas and i % args.M == 0:
             eng.atlas_capture()
 
@@ -157,18 +219,27 @@ def run_arm(eng, seed_x4, seed, arm, args):
     anchor_count = 0
     return_pre_anchor = None
     last_rgb = None
+    last_x4 = None
+    last_target_yaws = None
     for b in range(H):
+        yaw_before = float(eng.engine.camera_yaw)
         if is_atlas:
             eng.atlas_activate(offset=args.restamp_offset, k=args.atlas_k,
                                align_pose=True, retrieve="nearest")
             four, _info = gen_atlas_nowb((-args.yaw_mag, 0.0), project=True)
         else:
             four = gen_plain((-args.yaw_mag, 0.0))
+        yaw_after = float(eng.engine.camera_yaw)
+        yaw_delta = yaw_after - yaw_before
+        last_x4 = eng.all_rgb(four)
+        last_target_yaws = micro_yaw_grid(yaw_after, yaw_delta, n=len(last_x4))
         last_rgb = eng.last_rgb(four)
         return_pre_anchor = last_rgb
 
         if is_anchor and cadence and (b % cadence == 0):
-            last_rgb, ainfo = _append_anchor(eng, anchor_store, last_rgb, arm, args, anchor_count)
+            last_rgb, ainfo = _append_anchor(
+                eng, anchor_store, last_rgb, arm, args, anchor_count,
+                current_x4=last_x4, target_yaws=last_target_yaws)
             anchor_count = ainfo["anchor_count"]
             if ainfo["anchor"]:
                 ainfo = dict(ainfo)
@@ -176,7 +247,9 @@ def run_arm(eng, seed_x4, seed, arm, args):
                 anchor_infos.append(ainfo)
 
     if is_anchor and (cadence is None or ((H - 1) % cadence != 0)):
-        last_rgb, ainfo = _append_anchor(eng, anchor_store, last_rgb, arm, args, anchor_count)
+        last_rgb, ainfo = _append_anchor(
+            eng, anchor_store, last_rgb, arm, args, anchor_count,
+            current_x4=last_x4, target_yaws=last_target_yaws)
         anchor_count = ainfo["anchor_count"]
         if ainfo["anchor"]:
             ainfo = dict(ainfo)

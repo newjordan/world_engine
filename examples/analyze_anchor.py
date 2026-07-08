@@ -131,6 +131,10 @@ def main():
                 p = paired(post16, a, base)
                 if p:
                     paired_post.append(p)
+    if "anchor4_full" in arms and "anchor_full" in arms:
+        p = paired(post16, "anchor4_full", "anchor_full")
+        if p:
+            paired_post.append(p)
 
     curves = {}
     for a in arms:
@@ -156,10 +160,17 @@ def main():
         arm_rows = [r for r in rows if r["arm"] == a]
         info_rows = [r for r in arm_rows if r["dx_px"] is not None or r["resp"] is not None]
         acc = [r for r in info_rows if r["projected"]]
+        post1_anchor_counts = [
+            r["anchor_count"] for r in arm_rows if r["phase"] == "post" and r["idx"] == 1
+        ]
+        anchors = mean(post1_anchor_counts)
+        accept = sum(r["projected"] for r in info_rows) / len(info_rows) if info_rows else None
+        if a.startswith("anchor") and post1_anchor_counts and max(post1_anchor_counts) <= 1:
+            accept = anchors
         stats[a] = {
             "post16": mean(list(post16.get(a, {}).values())),
-            "anchors": mean([r["anchor_count"] for r in arm_rows if r["phase"] == "post" and r["idx"] == 1]),
-            "accept": sum(r["projected"] for r in info_rows) / len(info_rows) if info_rows else None,
+            "anchors": anchors,
+            "accept": accept,
             "dx": mean([abs(r["dx_px"]) for r in acc if r["dx_px"] is not None]) if acc else None,
             "resp": mean([r["resp"] for r in info_rows if r["resp"] is not None]),
         }

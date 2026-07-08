@@ -32,6 +32,7 @@ ANCHOR_ARMS = {
     "anchor", "anchor_blend", "anchor_k1", "anchor_k4",
     "anchor4_linear", "anchor4_blend", "anchor4_k4",
     "anchor_full", "anchor_full_blend", "anchor_confmap", "anchor_full_far",
+    "anchor4_full", "anchor4_full_blend", "anchor4_full_far",
 }
 ATLAS_ARMS = {"atlas_nowb"}
 
@@ -72,7 +73,7 @@ def _retrieve_mode(arm):
 
 
 def _mask_mode(arm):
-    if arm.startswith("anchor_full"):
+    if arm.startswith("anchor_full") or arm.startswith("anchor4_full"):
         return "full"
     if arm == "anchor_confmap":
         return "confmap"
@@ -125,7 +126,8 @@ def _append_anchor(eng, store, current_rgb, arm, args, anchor_count,
             target_yaws = [float(eng.engine.camera_yaw)] * len(current_x4)
         recon_x4, micro_infos = reconstruct_temporal_batch(
             store, current_x4, target_yaws,
-            blend=(arm == "anchor4_blend"),
+            retrieve=_retrieve_mode(arm),
+            blend=(arm in ("anchor4_blend", "anchor4_full_blend")),
             resp_min=args.resp_min,
             resp_full=args.resp_full,
             max_shift_frac=args.max_shift_frac,
