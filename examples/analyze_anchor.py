@@ -25,6 +25,10 @@ def fmt(x, nd=2):
     return "nan" if x is None or math.isnan(x) else f"{x:.{nd}f}"
 
 
+def finite(xs):
+    return [x for x in xs if x is not None and not math.isnan(x)]
+
+
 def read_rows(path):
     with open(path, newline="") as f:
         rows = list(csv.DictReader(f))
@@ -167,12 +171,14 @@ def main():
         accept = sum(r["projected"] for r in info_rows) / len(info_rows) if info_rows else None
         if a.startswith("anchor") and post1_anchor_counts and max(post1_anchor_counts) <= 1:
             accept = anchors
+        dx_vals = finite([abs(r["dx_px"]) for r in acc])
+        resp_vals = finite([r["resp"] for r in info_rows])
         stats[a] = {
             "post16": mean(list(post16.get(a, {}).values())),
             "anchors": anchors,
             "accept": accept,
-            "dx": mean([abs(r["dx_px"]) for r in acc if r["dx_px"] is not None]) if acc else None,
-            "resp": mean([r["resp"] for r in info_rows if r["resp"] is not None]),
+            "dx": mean(dx_vals) if dx_vals else None,
+            "resp": mean(resp_vals) if resp_vals else None,
         }
 
     try:

@@ -190,6 +190,38 @@ def test_reconstruct_temporal_batch_honors_farthest_retrieval():
     assert {i["kf_seq"] for i in far_infos} == {1}
 
 
+def test_anchor4_full_admission_variants_fail_closed():
+    from anchor_probe import _admission_failure
+
+    near = [
+        {"projected": True, "dx_px": 52.0, "resp": 0.32},
+        {"projected": True, "dx_px": 55.0, "resp": 0.31},
+        {"projected": True, "dx_px": 53.0, "resp": 0.34},
+        {"projected": True, "dx_px": 51.0, "resp": 0.30},
+    ]
+    far = [dict(i, dx_px=220.0, resp=0.19) for i in near]
+    weak = [dict(i, resp=0.19) for i in near]
+    partial = [dict(i) for i in near]
+    partial[2]["projected"] = False
+    pose_near = [
+        dict(i, target_yaw=1.00 + 0.05 * n, kf_frame_yaw=1.02 + 0.05 * n)
+        for n, i in enumerate(partial)
+    ]
+    pose_far = [
+        dict(i, target_yaw=1.00 + 0.05 * n, kf_frame_yaw=4.00 + 0.05 * n)
+        for n, i in enumerate(near)
+    ]
+
+    assert _admission_failure("anchor4_full_dx64", near) is None
+    assert _admission_failure("anchor4_full_far", partial) is None
+    assert _admission_failure("anchor4_full_dx96", far) == "admit_dx96"
+    assert _admission_failure("anchor4_full_dx96_far", far) == "admit_dx96"
+    assert _admission_failure("anchor4_full_resp25", weak) == "admit_resp25"
+    assert _admission_failure("anchor4_full_dx96_resp25", partial) == "admit_partial"
+    assert _admission_failure("anchor4_full_pose04", pose_near) is None
+    assert _admission_failure("anchor4_full_pose04_far", pose_far) == "admit_pose04"
+
+
 def test_reconstruct_temporal_batch_empty_store_falls_back_to_current():
     current = np.stack([_tex(seed=i, h=20, w=40) for i in range(4)], axis=0)
     recon, infos = reconstruct_temporal_batch(AnchorStore(), current, [0.0, 0.0, 0.0, 0.0])

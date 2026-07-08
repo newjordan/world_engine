@@ -35,6 +35,12 @@ ANCHOR_ARMS = {
     "anchor4_linear", "anchor4_blend", "anchor4_k4",
     "anchor_full", "anchor_full_blend", "anchor_confmap", "anchor_full_far",
     "anchor4_full", "anchor4_full_blend", "anchor4_full_far",
+    "anchor4_full_dx64", "anchor4_full_dx96", "anchor4_full_dx128",
+    "anchor4_full_resp25", "anchor4_full_dx96_resp25",
+    "anchor4_full_dx64_far", "anchor4_full_dx96_far", "anchor4_full_dx128_far",
+    "anchor4_full_resp25_far", "anchor4_full_dx96_resp25_far",
+    "anchor4_full_pose02", "anchor4_full_pose04",
+    "anchor4_full_pose02_far", "anchor4_full_pose04_far",
 }
 ATLAS_ARMS = {"atlas_nowb"}
 FONT = cv2.FONT_HERSHEY_SIMPLEX
@@ -70,6 +76,42 @@ def _mask_mode(arm):
     if arm == "anchor_confmap":
         return "confmap"
     return "band"
+
+
+def _admission_failure(arm, micro_infos):
+    has_pose = any(tok in arm for tok in ("pose02", "pose04"))
+    has_gate = has_pose or any(tok in arm for tok in ("dx64", "dx96", "dx128", "resp25"))
+    if not arm.startswith("anchor4_full_") or not has_gate:
+        return None
+    projected = [i for i in micro_infos if i.get("projected")]
+    if not projected:
+        return None
+    if not has_pose and len(projected) != len(micro_infos):
+        return "admit_partial"
+    dx_abs = [abs(i["dx_px"]) for i in projected if i.get("dx_px") is not None]
+    resp = [i["resp"] for i in projected if i.get("resp") is not None]
+    dx_mean = float(np.mean(dx_abs)) if dx_abs else float("inf")
+    resp_mean = float(np.mean(resp)) if resp else 0.0
+    if has_pose:
+        pose_errs = []
+        for i in projected:
+            if i.get("target_yaw") is None or i.get("kf_frame_yaw") is None:
+                return "admit_pose_unknown"
+            pose_errs.append(abs(float(i["target_yaw"]) - float(i["kf_frame_yaw"])))
+        pose_max = max(pose_errs) if pose_errs else float("inf")
+        if "pose02" in arm and pose_max > 0.2:
+            return "admit_pose02"
+        if "pose04" in arm and pose_max > 0.4:
+            return "admit_pose04"
+    if "dx64" in arm and dx_mean > 64.0:
+        return "admit_dx64"
+    if "dx96" in arm and dx_mean > 96.0:
+        return "admit_dx96"
+    if "dx128" in arm and dx_mean > 128.0:
+        return "admit_dx128"
+    if "resp25" in arm and resp_mean < 0.25:
+        return "admit_resp25"
+    return None
 
 
 def _summarize_micro_infos(micro_infos, anchor_count):
@@ -112,9 +154,14 @@ def _append_anchor(eng, store, current_rgb, arm, args, anchor_count,
             feather=args.pixel_feather,
             mask_mode=_mask_mode(arm),
         )
-        if not any(i.get("projected") for i in micro_infos):
+        admit_failure = _admission_failure(arm, micro_infos)
+        if not any(i.get("projected") for i in micro_infos) or admit_failure:
             info = _summarize_micro_infos(micro_infos, anchor_count)
-            info.update(anchor=False)
+            if admit_failure:
+                info.update(projected=False, reject=admit_failure)
+            high_level = dict(info)
+            high_level.pop("micro_infos", None)
+            info.update(anchor=False, micro_infos=[high_level])
             return current_rgb, info
 
         ctrl = eng._CtrlInput(button=set(), mouse=(0.0, 0.0))
