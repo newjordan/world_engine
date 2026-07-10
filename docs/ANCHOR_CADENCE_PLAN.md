@@ -8,6 +8,28 @@ pan packet `bench_out/anchor_reacq/pan180_scene0_seed1235/` (locked 217 away
 steps, measured 180.16 deg).
 **Run label:** `new_experiment` (aggregate sweep); pilots are `scout`.
 
+## Amendment 10h.1 - Far-cadence pool cardinality (2026-07-10)
+
+The first 1x1 Protocol A wiring scout refuted the original far-control
+construction, not the pose window. Raw artifacts:
+`bench_out/anchor_cadence/pilot.csv` and `pilot.log`, source commit `28fb15e`.
+At return headings 3.8, 3.0, and 2.2, the `mode="max", k=8` pool had only
+5/4/7 of its eight candidates outside the 3.0-unit pose window. The remaining
+in-window tail produced three real accepts (67% attempt accept rate overall),
+with winner drifts -2.6, -2.6, and +2.8 yaw units. Thus the window was applied
+correctly; the assumption that eight farthest candidates would all remain
+outside it near the midpoint of a roughly 6.2-unit store span was false.
+
+For the Phase 10h cadence `_far` falsification arm only, candidate cardinality
+is amended to `k=1` before the unchanged pose window. The single farthest
+keyframe remains outside the 3.0-unit window over this locked return path, so
+the arm again tests the stated no-teleport invariant. Non-far cadence arms keep
+`--reacq-k 8`, and the already-reported Phase 10g closure-only far condition is
+unchanged. This is a control-construction repair, not matcher tuning: response,
+shift, pose window, admission gates, cadence, and model condition are frozen.
+The scout must be rerun from committed code and show every cadence-far attempt
+as `nomatch` before the pilot may launch.
+
 ## Question
 
 Phase 10g proved the closure-time re-acquisition machinery is correct and

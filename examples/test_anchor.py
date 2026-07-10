@@ -471,6 +471,15 @@ def test_cadence_reacq_arms_registered_with_10g_token_semantics():
         assert _admission_failure(arm, spread) == "admit_consist"
 
 
+def test_cadence_far_control_uses_only_the_farthest_candidate():
+    from anchor_probe import _reacq_k
+
+    assert _reacq_k("anchor4_full_reacq_k4_pose02_far", 8) == 1
+    assert _reacq_k("anchor4_full_reacq_k4_pose02", 8) == 8
+    # Preserve the already-reported Phase 10g closure-only condition.
+    assert _reacq_k("anchor4_full_reacq_pose02_far", 8) == 8
+
+
 def test_needs_final_anchor_gate_arithmetic():
     from anchor_probe import _needs_final_anchor
 
@@ -497,7 +506,7 @@ def test_shared_helpers_byte_identical_between_probe_and_visual():
 
     assert anchor_probe.ANCHOR_ARMS == anchor_visual.ANCHOR_ARMS
     shared = ["_cadence", "_needs_final_anchor", "_is_anchor4", "_retrieve_mode",
-              "_is_reacq", "_reacq_pool", "_mask_mode", "_admission_failure",
+              "_is_reacq", "_reacq_pool", "_reacq_k", "_mask_mode", "_admission_failure",
               "_summarize_micro_infos", "_fmtn", "_append_reacq", "_append_anchor"]
     for name in shared:
         probe_src = inspect.getsource(getattr(anchor_probe, name))

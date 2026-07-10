@@ -28,7 +28,7 @@ from anchor import (AnchorStore, blend_u8, confidence_alpha, micro_yaw_grid,
                     reacq_reconstruct, reconstruct_from_keyframe,
                     reconstruct_temporal_batch, repeat_as_x4)
 from anchor_probe import (ANCHOR_ARMS, _admission_failure, _cadence, _is_reacq,
-                          _mask_mode, _needs_final_anchor, _reacq_pool,
+                          _mask_mode, _needs_final_anchor, _reacq_k, _reacq_pool,
                           _retrieve_mode, _summarize_micro_infos)
 from atlas import AtlasStore, _clear_pins
 from permanence_bench import RealEngine, _noop, load_seeds, psnr
@@ -80,7 +80,7 @@ def _append_anchor_x4(eng, store, current_rgb, arm, args, current_x4, target_yaw
         yaw = float(eng.engine.camera_yaw)
         recon_x4, micro_infos, diag = reacq_reconstruct(
             store, current_x4, yaw,
-            k=args.reacq_k, mode=_reacq_pool(arm),
+            k=_reacq_k(arm, args.reacq_k), mode=_reacq_pool(arm),
             resp_min=args.resp_min, resp_full=args.resp_full,
             max_shift_frac=args.max_shift_frac, feather=args.pixel_feather,
             mask_mode=_mask_mode(arm))

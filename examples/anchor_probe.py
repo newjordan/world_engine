@@ -97,6 +97,13 @@ def _reacq_pool(arm):
     return "max" if arm.endswith("_far") else "min"
 
 
+def _reacq_k(arm, default_k):
+    # Phase 10h.1: an eight-item farthest-first pool reaches back inside the
+    # pose window near the midpoint of a finite pan. Keep this control wholly
+    # far by presenting only the single farthest candidate to the window.
+    return 1 if arm.endswith("_far") and _cadence(arm) is not None else default_k
+
+
 def _mask_mode(arm):
     if arm.startswith("anchor_full") or arm.startswith("anchor4_full"):
         return "full"
@@ -189,7 +196,7 @@ def _append_reacq(eng, store, current_rgb, arm, args, anchor_count, current_x4):
     yaw = float(eng.engine.camera_yaw)
     recon_x4, micro_infos, diag = reacq_reconstruct(
         store, current_x4, yaw,
-        k=args.reacq_k, mode=_reacq_pool(arm),
+        k=_reacq_k(arm, args.reacq_k), mode=_reacq_pool(arm),
         resp_min=args.resp_min, resp_full=args.resp_full,
         max_shift_frac=args.max_shift_frac, feather=args.pixel_feather,
         mask_mode=_mask_mode(arm))
