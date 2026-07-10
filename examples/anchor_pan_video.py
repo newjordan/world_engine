@@ -27,8 +27,9 @@ import torch
 from anchor import (AnchorStore, blend_u8, confidence_alpha, micro_yaw_grid,
                     reacq_reconstruct, reconstruct_from_keyframe,
                     reconstruct_temporal_batch, repeat_as_x4)
-from anchor_probe import (ANCHOR_ARMS, _admission_failure, _is_reacq, _mask_mode,
-                          _reacq_pool, _retrieve_mode, _summarize_micro_infos)
+from anchor_probe import (ANCHOR_ARMS, _admission_failure, _cadence, _is_reacq,
+                          _mask_mode, _needs_final_anchor, _reacq_pool,
+                          _retrieve_mode, _summarize_micro_infos)
 from atlas import AtlasStore, _clear_pins
 from permanence_bench import RealEngine, _noop, load_seeds, psnr
 from rigid import RigidStore, band_mask, rigid_step
@@ -43,6 +44,26 @@ def _sha256(path):
     except OSError:
         return "missing"
     return hashlib.sha256(data).hexdigest()[:16]
+
+
+def _jsonable(value):
+    """Coerce numpy scalars/arrays (possibly nested) to JSON-serializable types."""
+    if isinstance(value, dict):
+        return {k: _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    return value
+
+
+def _cadence_attempt(b, deg, info, closure):
+    """Manifest row for one cadence anchor attempt (per-micro detail elided)."""
+    entry = {"b": int(b), "deg": float(deg), "closure": bool(closure)}
+    entry.update({k: v for k, v in info.items() if k != "micro_infos"})
+    return _jsonable(entry)
 
 
 def pc_shift(prev, gray):
@@ -131,7 +152,34 @@ def _append_anchor_x4(eng, store, current_rgb, arm, args, current_x4, target_yaw
     return eng.all_rgb(four), info
 
 
-def run_arm(eng, seed_x4, seed, arm, args, n_away=None):
+class FrameSpool:
+    """Disk-backed frame list: PNG spill keeps peak resident frames O(1)."""
+
+    def __init__(self, root):
+        self.root = pathlib.Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.meta = []
+
+    def append(self, phase, deg, rgb):
+        path = self.root / f"{len(self.meta):06d}.png"
+        if not cv2.imwrite(str(path), cv2.cvtColor(np.ascontiguousarray(rgb),
+                                                   cv2.COLOR_RGB2BGR)):
+            raise OSError(f"frame spill failed: {path}")
+        self.meta.append({"phase": phase, "deg": float(deg), "path": str(path)})
+
+    def __len__(self):
+        return len(self.meta)
+
+    def __getitem__(self, i):
+        m = self.meta[i]
+        bgr = cv2.imread(m["path"], cv2.IMREAD_COLOR)
+        if bgr is None:
+            raise OSError(f"frame spill unreadable: {m['path']}")
+        return {"phase": m["phase"], "deg": m["deg"],
+                "rgb": cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)}
+
+
+def run_arm(eng, seed_x4, seed, arm, args, spool_dir, n_away=None):
     is_anchor = arm in ANCHOR_ARMS
     is_atlas = arm in ATLAS_ARMS
     torch.manual_seed(seed)
@@ -163,7 +211,7 @@ def run_arm(eng, seed_x4, seed, arm, args, n_away=None):
             write_back=False,
         )
 
-    video = []
+    video = FrameSpool(spool_dir)
     start = None
     last_yaw_delta = 0.0
     prev_gray = None
@@ -177,7 +225,7 @@ def run_arm(eng, seed_x4, seed, arm, args, n_away=None):
         yaw_after = float(eng.engine.camera_yaw)
         last_yaw_delta = yaw_after - yaw_before
         for r in eng.all_rgb(four)[::args.subsample]:
-            video.append({"phase": "settle", "deg": 0.0, "rgb": r})
+            video.append("settle", 0.0, r)
         start = eng.last_rgb(four)
         prev_gray = cv2.cvtColor(start, cv2.COLOR_RGB2GRAY)
         ppr = start.shape[1] * (360.0 / args.fov)
@@ -203,7 +251,7 @@ def run_arm(eng, seed_x4, seed, arm, args, n_away=None):
         away_deg += pc_shift(prev_gray, gray) / ppr * 360.0
         prev_gray = gray
         for r in eng.all_rgb(four)[::args.subsample]:
-            video.append({"phase": "pan away", "deg": away_deg, "rgb": r})
+            video.append("pan away", away_deg, r)
         if is_anchor and away_steps % args.M == 0:
             anchor_store.insert(eng.all_rgb(four), float(eng.engine.camera_yaw),
                                 yaw_delta=yaw_delta)
@@ -215,6 +263,8 @@ def run_arm(eng, seed_x4, seed, arm, args, n_away=None):
         ):
             break
 
+    cadence = _cadence(arm)
+    cadence_attempts = []
     last_rgb = None
     last_x4 = None
     last_target_yaws = None
@@ -233,15 +283,27 @@ def run_arm(eng, seed_x4, seed, arm, args, n_away=None):
         last_rgb = eng.last_rgb(four)
         remaining = max(0.0, away_deg * (1.0 - float(b + 1) / max(away_steps, 1)))
         for r in last_x4[::args.subsample]:
-            video.append({"phase": "return", "deg": remaining, "rgb": r})
+            video.append("return", remaining, r)
+
+        if is_anchor and cadence and (b % cadence == 0):
+            anchor_x4, ainfo = _append_anchor_x4(
+                eng, anchor_store, last_rgb, arm, args, last_x4, last_target_yaws)
+            cadence_attempts.append(_cadence_attempt(
+                b, remaining, ainfo, closure=(b == away_steps - 1)))
+            if anchor_x4 is not None:
+                for r in anchor_x4[::args.subsample]:
+                    video.append("anchor cadence", remaining, r)
 
     anchor_info = {}
-    if is_anchor:
+    if is_anchor and _needs_final_anchor(cadence, away_steps):
         anchor_x4, anchor_info = _append_anchor_x4(
             eng, anchor_store, last_rgb, arm, args, last_x4, last_target_yaws)
         if anchor_x4 is not None:
             for r in anchor_x4[::args.subsample]:
-                video.append({"phase": "anchor append", "deg": 0.0, "rgb": r})
+                video.append("anchor append", 0.0, r)
+        if cadence:
+            cadence_attempts.append(_cadence_attempt(
+                away_steps - 1, 0.0, anchor_info, closure=True))
 
     if is_atlas:
         _clear_pins(eng.engine.kv_cache)
@@ -253,7 +315,7 @@ def run_arm(eng, seed_x4, seed, arm, args, n_away=None):
         if p in (16, 64):
             post[p] = rgb
         for r in eng.all_rgb(four)[::args.subsample]:
-            video.append({"phase": f"post {p:02d}", "deg": 0.0, "rgb": r})
+            video.append(f"post {p:02d}", 0.0, r)
 
     return {
         "arm": arm,
@@ -262,6 +324,7 @@ def run_arm(eng, seed_x4, seed, arm, args, n_away=None):
         "away_steps": away_steps,
         "away_deg": away_deg,
         "anchor_info": anchor_info,
+        "cadence_attempts": cadence_attempts,
         "post16_psnr": psnr(start, post[16]) if 16 in post else None,
         "post64_psnr": psnr(start, post[64]) if 64 in post else None,
     }
@@ -286,44 +349,54 @@ def metric_text(res):
         parts.append(f"p16 {res['post16_psnr']:.1f}dB")
     if info:
         parts.append("anchored" if info.get("anchor") else f"reject {info.get('reject', '')}")
+    attempts = res.get("cadence_attempts") or []
+    if attempts:
+        accepted = sum(1 for a in attempts if a.get("anchor"))
+        parts.append(f"cad {accepted}/{len(attempts)}")
     return " | ".join(parts)
 
 
 def write_single_mp4(path, res, fps):
-    frames = [panel(v, res["arm"], metric_text(res)) for v in res["video"]]
-    write_mp4(path, frames, fps)
+    metric = metric_text(res)
+    write_mp4(path, lambda: (panel(v, res["arm"], metric) for v in res["video"]), fps)
 
 
 def write_compare_mp4(path, results, fps):
     order = list(results)
     while len(order) < 4:
         order.append(order[-1])
-    max_len = max(len(r["video"]) for r in order[:4])
-    frames = []
-    for i in range(max_len):
-        cells = []
-        for r in order[:4]:
-            idx = min(i, len(r["video"]) - 1)
-            cells.append(panel(r["video"][idx], r["arm"], metric_text(r)))
-        frames.append(np.vstack([np.hstack(cells[:2]), np.hstack(cells[2:4])]))
+    order = order[:4]
+    max_len = max(len(r["video"]) for r in order)
+
+    def frames():
+        for i in range(max_len):
+            cells = [panel(r["video"][min(i, len(r["video"]) - 1)], r["arm"],
+                           metric_text(r)) for r in order]
+            yield np.vstack([np.hstack(cells[:2]), np.hstack(cells[2:4])])
+
     write_mp4(path, frames, fps)
 
 
-def write_mp4(path, frames, fps):
+def write_mp4(path, make_frames, fps):
+    # make_frames: zero-arg callable returning a fresh frame iterator, so the
+    # cv2 fallback can restart the stream if imageio fails partway.
     os.makedirs(os.path.dirname(path), exist_ok=True)
     try:
         import imageio
         with imageio.get_writer(path, fps=fps, codec="libx264", quality=8,
                                 macro_block_size=1) as w:
-            for f in frames:
+            for f in make_frames():
                 w.append_data(f)
         return
     except Exception:
         pass
-    h, w = frames[0].shape[:2]
+    it = iter(make_frames())
+    first = next(it)
+    h, w = first.shape[:2]
     tmp_path = str(pathlib.Path(path).with_suffix(".tmp.mp4"))
     vw = cv2.VideoWriter(tmp_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
-    for f in frames:
+    vw.write(cv2.cvtColor(first, cv2.COLOR_RGB2BGR))
+    for f in it:
         vw.write(cv2.cvtColor(f, cv2.COLOR_RGB2BGR))
     vw.release()
     if shutil.which("ffmpeg"):
@@ -339,6 +412,12 @@ def write_mp4(path, frames, fps):
         except subprocess.CalledProcessError:
             pass
     os.replace(tmp_path, path)
+
+
+def cleanup_frames(out, keep_frames):
+    if keep_frames:
+        return
+    shutil.rmtree(os.path.join(out, "tmp_frames"), ignore_errors=True)
 
 
 def write_index(out, manifest, videos):
@@ -401,6 +480,8 @@ def main():
     ap.add_argument("--subsample", type=int, default=1)
     ap.add_argument("--fps", type=int, default=30)
     ap.add_argument("--out", default="bench_out/anchor_admission/pan180_case0")
+    ap.add_argument("--keep-frames", action="store_true",
+                    help="retain the tmp_frames/ PNG spill after MP4s are written")
     args = ap.parse_args()
 
     arms = [a.strip() for a in args.arms.split(",") if a.strip()]
@@ -434,7 +515,8 @@ def main():
     n_away = None
     for arm in arms:
         print(f"  pan180 {scene_name} seed {args.seed} {arm}", flush=True)
-        res = run_arm(eng, seed_x4, args.seed, arm, args, n_away=n_away)
+        res = run_arm(eng, seed_x4, args.seed, arm, args,
+                      os.path.join(args.out, "tmp_frames", arm), n_away=n_away)
         if n_away is None:
             n_away = res["away_steps"]
             print(f"  locked command pan steps: {n_away} ({res['away_deg']:.1f} deg baseline content)")
@@ -474,6 +556,7 @@ def main():
     }
     pathlib.Path(args.out, "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     write_index(args.out, manifest, videos)
+    cleanup_frames(args.out, args.keep_frames)
     print(f"wrote {args.out}/index.html")
     print(f"wrote {args.out}/manifest.json")
     for v in videos:

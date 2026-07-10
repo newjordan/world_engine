@@ -40,6 +40,8 @@ ANCHOR_ARMS = {
     "anchor4_full_pose02", "anchor4_full_pose04",
     "anchor4_full_pose02_far", "anchor4_full_pose04_far",
     "anchor4_full_reacq_pose02", "anchor4_full_reacq_pose02_far",
+    "anchor4_full_reacq_k4_pose02", "anchor4_full_reacq_k4_pose02_far",
+    "anchor4_full_reacq_k8_pose02", "anchor4_full_reacq_k8_pose02_far",
 }
 ATLAS_ARMS = {"atlas_nowb"}
 
@@ -64,11 +66,19 @@ def _sha256(path):
 
 
 def _cadence(arm):
-    if arm == "anchor_k1":
-        return 1
-    if arm in ("anchor_k4", "anchor4_k4"):
-        return 4
+    # Cadence is the "_k<digits>" token: anchor_k1, anchor_k4, anchor4_k4, and
+    # the 10h cadence-reacq arms (anchor4_full_reacq_k4_pose02[_far], k8 pilot).
+    for tok in arm.split("_"):
+        if len(tok) > 1 and tok[0] == "k" and tok[1:].isdigit():
+            return int(tok[1:])
     return None
+
+
+def _needs_final_anchor(cadence, n_return_steps):
+    # Loop-closure anchor after the return leg: always for closure-only arms,
+    # and for cadence arms only when the last return step (b = n-1) did not
+    # already carry a cadence attempt.
+    return cadence is None or ((n_return_steps - 1) % cadence != 0)
 
 
 def _is_anchor4(arm):
@@ -409,7 +419,7 @@ def run_trial(eng, seed_x4, seed, arm, args):
 
     # Single loop-closure anchor for non-cadence anchor arms. Cadence arms also anchor
     # at the end if their last cadence did not already land on the final return step.
-    needs_final_anchor = is_anchor and (cadence is None or ((H - 1) % cadence != 0))
+    needs_final_anchor = is_anchor and _needs_final_anchor(cadence, H)
     if needs_final_anchor:
         last_rgb, ainfo = _append_anchor(
             eng, anchor_store, last_rgb, arm, args, anchor_count,

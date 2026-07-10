@@ -423,6 +423,88 @@ def test_pose_plausibility_residuals_do_not_separate_pilot2():
     assert pose_plausible(208.559, 31.431, 5.2)
 
 
+def test_cadence_parses_k_token_without_misfiring_on_other_arms():
+    from anchor_probe import ANCHOR_ARMS, _cadence
+
+    # Legacy exact names keep their values.
+    assert _cadence("anchor_k1") == 1
+    assert _cadence("anchor_k4") == 4
+    assert _cadence("anchor4_k4") == 4
+    # Phase 10h cadence-reacq arms; _far stays terminal and keeps the cadence.
+    assert _cadence("anchor4_full_reacq_k4_pose02") == 4
+    assert _cadence("anchor4_full_reacq_k4_pose02_far") == 4
+    assert _cadence("anchor4_full_reacq_k8_pose02") == 8
+    assert _cadence("anchor4_full_reacq_k8_pose02_far") == 8
+    # Closure-only arms and non-anchor arms have no cadence.
+    assert _cadence("anchor4_full_reacq_pose02") is None
+    assert _cadence("revisit") is None
+    assert _cadence("atlas_nowb") is None
+    # Sweep: no other registered arm accidentally gains a cadence.
+    with_cadence = {a for a in ANCHOR_ARMS if _cadence(a) is not None}
+    assert with_cadence == {
+        "anchor_k1", "anchor_k4", "anchor4_k4",
+        "anchor4_full_reacq_k4_pose02", "anchor4_full_reacq_k4_pose02_far",
+        "anchor4_full_reacq_k8_pose02", "anchor4_full_reacq_k8_pose02_far",
+    }
+
+
+def test_cadence_reacq_arms_registered_with_10g_token_semantics():
+    from anchor_probe import (ANCHOR_ARMS, _admission_failure, _is_reacq,
+                              _mask_mode, _reacq_pool, _retrieve_mode)
+
+    new = ["anchor4_full_reacq_k4_pose02", "anchor4_full_reacq_k4_pose02_far",
+           "anchor4_full_reacq_k8_pose02", "anchor4_full_reacq_k8_pose02_far"]
+    tight = [
+        dict(projected=True, dx_px=8.0 + n, resp=0.3, target_yaw=1.0 + 0.1 * n,
+             kf_frame_yaw=1.0 + 0.1 * n)
+        for n in range(4)
+    ]
+    spread = [dict(i) for i in tight]
+    spread[3]["dx_px"] = 60.0
+    for arm in new:
+        assert arm in ANCHOR_ARMS
+        assert _is_reacq(arm)
+        assert _mask_mode(arm) == "full"
+        assert _reacq_pool(arm) == ("max" if arm.endswith("_far") else "min")
+        assert _retrieve_mode(arm) == ("farthest" if arm.endswith("_far") else "nearest")
+        assert _admission_failure(arm, tight) is None
+        assert _admission_failure(arm, spread) == "admit_consist"
+
+
+def test_needs_final_anchor_gate_arithmetic():
+    from anchor_probe import _needs_final_anchor
+
+    # Closure-only arms always take the final anchor.
+    for n in (1, 2, 216, 217):
+        assert _needs_final_anchor(None, n)
+    # Locked pan case: 217 return steps -> b=216 hits both k4 and k8 cadences.
+    assert not _needs_final_anchor(4, 217)
+    assert not _needs_final_anchor(8, 217)
+    assert _needs_final_anchor(4, 216)   # last cadence attempt lands at b=212
+    assert _needs_final_anchor(8, 220)   # last cadence attempt lands at b=216
+    # Property: final anchor fires iff no cadence attempt landed on the last step.
+    for cadence in (1, 2, 4, 8):
+        for n in range(1, 26):
+            attempts = [b for b in range(n) if b % cadence == 0]
+            assert _needs_final_anchor(cadence, n) == (attempts[-1] != n - 1)
+
+
+def test_shared_helpers_byte_identical_between_probe_and_visual():
+    import inspect
+
+    import anchor_probe
+    import anchor_visual
+
+    assert anchor_probe.ANCHOR_ARMS == anchor_visual.ANCHOR_ARMS
+    shared = ["_cadence", "_needs_final_anchor", "_is_anchor4", "_retrieve_mode",
+              "_is_reacq", "_reacq_pool", "_mask_mode", "_admission_failure",
+              "_summarize_micro_infos", "_fmtn", "_append_reacq", "_append_anchor"]
+    for name in shared:
+        probe_src = inspect.getsource(getattr(anchor_probe, name))
+        visual_src = inspect.getsource(getattr(anchor_visual, name))
+        assert probe_src == visual_src, f"{name} drifted between anchor_probe and anchor_visual"
+
+
 def test_pose_window_is_spacing_aware():
     wide = AnchorStore(tau_insert=0.1)
     for y in (0.0, 4.0, 8.0, 12.0):

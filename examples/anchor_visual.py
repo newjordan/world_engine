@@ -42,6 +42,8 @@ ANCHOR_ARMS = {
     "anchor4_full_pose02", "anchor4_full_pose04",
     "anchor4_full_pose02_far", "anchor4_full_pose04_far",
     "anchor4_full_reacq_pose02", "anchor4_full_reacq_pose02_far",
+    "anchor4_full_reacq_k4_pose02", "anchor4_full_reacq_k4_pose02_far",
+    "anchor4_full_reacq_k8_pose02", "anchor4_full_reacq_k8_pose02_far",
 }
 ATLAS_ARMS = {"atlas_nowb"}
 FONT = cv2.FONT_HERSHEY_SIMPLEX
@@ -56,11 +58,19 @@ def _sha256(path):
 
 
 def _cadence(arm):
-    if arm == "anchor_k1":
-        return 1
-    if arm in ("anchor_k4", "anchor4_k4"):
-        return 4
+    # Cadence is the "_k<digits>" token: anchor_k1, anchor_k4, anchor4_k4, and
+    # the 10h cadence-reacq arms (anchor4_full_reacq_k4_pose02[_far], k8 pilot).
+    for tok in arm.split("_"):
+        if len(tok) > 1 and tok[0] == "k" and tok[1:].isdigit():
+            return int(tok[1:])
     return None
+
+
+def _needs_final_anchor(cadence, n_return_steps):
+    # Loop-closure anchor after the return leg: always for closure-only arms,
+    # and for cadence arms only when the last return step (b = n-1) did not
+    # already carry a cadence attempt.
+    return cadence is None or ((n_return_steps - 1) % cadence != 0)
 
 
 def _is_anchor4(arm):
@@ -360,7 +370,7 @@ def run_arm(eng, seed_x4, seed, arm, args):
                 ainfo["heading"] = round((H - 1 - b) * args.yaw_mag, 6)
                 anchor_infos.append(ainfo)
 
-    if is_anchor and (cadence is None or ((H - 1) % cadence != 0)):
+    if is_anchor and _needs_final_anchor(cadence, H):
         last_rgb, ainfo = _append_anchor(
             eng, anchor_store, last_rgb, arm, args, anchor_count,
             current_x4=last_x4, target_yaws=last_target_yaws)
