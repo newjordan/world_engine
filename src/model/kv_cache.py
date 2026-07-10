@@ -1,6 +1,7 @@
 from torch import Tensor
 import torch
 from torch import nn
+from typing import Any, Optional
 from tensordict import TensorDict
 
 from torch.nn.attention.flex_attention import (
@@ -55,24 +56,63 @@ def make_block_mask(T: int, L: int, written: torch.Tensor) -> BlockMask:
     )
 
 
-def restamp_temporal_k(k: Tensor, delta: float, inv_t: Tensor, n_spatial_pairs: int) -> Tensor:
-    """Re-position a post-RoPE key in *time* by `delta` frames, exactly.
+def restamp_temporal_k(
+    k: Tensor,
+    delta: float,
+    inv_t: Tensor,
+    n_spatial_pairs: int,
+    *,
+    dx_norm: float = 0.0,
+    dy_norm: float = 0.0,
+    xy: Optional[Tensor] = None,
+    n_x_pairs: int = 0,
+    n_y_pairs: int = 0,
+) -> Tensor:
+    """Re-position a post-RoPE key by the full (x, y, t) camera-pose delta.
 
-    OrthoRoPE (see model/attn.py) rotates each freq-pair (a,b) by its angle and stores
-    the result de-interleaved as two concatenated halves: k = [y0_0..y0_{h-1} |
-    y1_0..y1_{h-1}] where (y0_k, y1_k) = R(theta_k) . (a_k, b_k). Temporal RoPE is
-    relative and ts_mult == 1, so a key roped at frame f is turned into the key it would
-    have been at frame f+delta by composing an extra rotation R(delta * inv_t) on the
-    temporal freq-pairs only — the spatial x/y pairs (the first `n_spatial_pairs` freqs)
-    are left untouched, so the key keeps its pixel identity but moves in time.
+    Temporal-only special case (default, when xy is None): rotates only the temporal
+    freq-pairs by `delta * inv_t`, leaving the spatial x/y pairs untouched — this is
+    the original behavior, used when we have no pose signal. When xy is provided, the
+    key is additionally rotated on the x/y freq-pairs by `dx_norm`/`dy_norm` — turning
+    a keyframe captured at camera pose P_pin into the key it would have been had it
+    been captured at P_pin + (dx, dy, dt). This aligns the memory's spatial phase
+    with the current camera heading, closing the spatial mismatch that pure temporal
+    restamping leaves open (see docs/ATLAS_PLAN.md Phase 6).
+
+    The additional rotation angle per freq-pair:
+      x pairs [0, n_x):           xy[i]      * dx_norm
+      y pairs [n_x, n_x+n_y):     xy[i-n_x]  * dy_norm
+      t pairs [n_x+n_y, half):    inv_t[j]   * dt
+
+    where dx_norm = 2*dx_pixels/W, dy_norm = 2*dy_pixels/H (the derivative of the
+    OrthoRoPEAngles normalized coordinate w.r.t. pixel position). For a yaw-only
+    1-DOF camera, only dx_norm is nonzero. All tokens in a frame share the same
+    camera-pose delta, so a single phi vector rotates every token.
 
     k: [..., d_head] post-RoPE key(s). Returns a new tensor of the same shape/dtype.
+    xy: [n_x_pairs] spatial inverse-frequency vector (= OrthoRoPEAngles.xy).
+    inv_t: [n_t_pairs] temporal inverse-frequency vector.
     """
     half = k.shape[-1] // 2
     n_t = inv_t.numel()
-    assert n_spatial_pairs + n_t == half, (n_spatial_pairs, n_t, half)
     phi = k.new_zeros(half, dtype=torch.float32)
-    phi[n_spatial_pairs:] = inv_t.to(torch.float32) * float(delta)
+
+    if xy is not None:
+        # Full (x, y, t) pose restamp: pin a keyframe captured at camera pose P_pin
+        # and align it to the current heading P_pin + (dx_norm, dy_norm, dt).
+        n_spatial = n_x_pairs + n_y_pairs
+        if not torch.compiler.is_compiling():
+            assert n_spatial + n_t == half, (n_x_pairs, n_y_pairs, n_t, half)
+            assert dx_norm >= 0.0 and dy_norm >= 0.0 or True  # signed deltas allowed
+        phi[:n_x_pairs] = xy[:n_x_pairs].to(torch.float32) * float(dx_norm)
+        phi[n_x_pairs:n_spatial] = xy[:n_y_pairs].to(torch.float32) * float(dy_norm)
+        phi[n_spatial:] = inv_t.to(torch.float32) * float(delta)
+    else:
+        # Pure temporal restamp (original): move only in time, leave spatial untouched.
+        if not torch.compiler.is_compiling():
+            assert n_spatial_pairs + n_t == half, (n_spatial_pairs, n_t, half)
+        phi[n_spatial_pairs:] = inv_t.to(torch.float32) * float(delta)
+
     cos, sin = phi.cos(), phi.sin()
     kf = k.float()
     k0, k1 = kf[..., :half], kf[..., half:]
@@ -90,40 +130,16 @@ def restamp_pose_k(
     n_x_pairs: int,
     n_y_pairs: int,
 ) -> Tensor:
-    """Re-position a post-RoPE key by the full (x, y, t) camera-pose delta, exactly.
+    """Re-position a post-RoPE key by the full (x, y, t) camera-pose delta.
 
-    Extends restamp_temporal_k to also rotate the spatial x/y RoPE phases, so a pinned
-    keyframe captured at camera pose P_pin is turned into the key it would have been had
-    it been captured at P_pin + (dx, dy, dt). This aligns the memory's spatial phase
-    with the current camera heading, closing the spatial mismatch that pure temporal
-    restamping leaves open.
-
-    The additional rotation angle per freq-pair:
-      x pairs [0, n_x):           xy[i]      * dx_norm
-      y pairs [n_x, n_x+n_y):     xy[i-n_x]  * dy_norm
-      t pairs [n_x+n_y, half):    inv_t[j]   * dt
-
-    where dx_norm = 2*dx_pixels/W, dy_norm = 2*dy_pixels/H (the derivative of the
-    OrthoRoPEAngles normalized coordinate w.r.t. pixel position). All tokens in a frame
-    share the same camera-pose delta, so a single phi vector rotates every token.
-
-    k: [..., d_head] post-RoPE key(s). Returns a new tensor of the same shape/dtype.
-    xy: [n_x_pairs] spatial inverse-frequency vector (= OrthoRoPEAngles.xy).
-    inv_t: [n_t_pairs] temporal inverse-frequency vector.
+    Thin restamp_pins-facing wrapper over :func:`restamp_temporal_k` with all three
+    axes active. Kept for callers/tests that want an explicit pose-only signature.
     """
-    half = k.shape[-1] // 2
-    n_t = inv_t.numel()
-    n_spatial = n_x_pairs + n_y_pairs
-    assert n_spatial + n_t == half, (n_x_pairs, n_y_pairs, n_t, half)
-    phi = k.new_zeros(half, dtype=torch.float32)
-    phi[:n_x_pairs] = xy[:n_x_pairs].to(torch.float32) * float(dx_norm)
-    phi[n_x_pairs:n_spatial] = xy[:n_y_pairs].to(torch.float32) * float(dy_norm)
-    phi[n_spatial:] = inv_t.to(torch.float32) * float(dt)
-    cos, sin = phi.cos(), phi.sin()
-    kf = k.float()
-    k0, k1 = kf[..., :half], kf[..., half:]
-    out = torch.cat((k0 * cos - k1 * sin, k1 * cos + k0 * sin), dim=-1)
-    return out.to(k.dtype)
+    return restamp_temporal_k(
+        k, dt, inv_t, n_x_pairs + n_y_pairs,
+        dx_norm=dx_norm, dy_norm=dy_norm, xy=xy,
+        n_x_pairs=n_x_pairs, n_y_pairs=n_y_pairs,
+    )
 
 
 class LayerKVCache(nn.Module):
@@ -226,7 +242,7 @@ class LayerKVCache(nn.Module):
         height: int = None,
     ):
         """Re-position every populated pin slot's key in time to `target_f`, and
-        optionally in the spatial (yaw) phase to `target_yaw`.
+        optionally in the spatial (x,y) phase to `target_yaw`.
 
         Temporal restamp (always): composes R(dt * inv_t) on the temporal freq-pairs so
         a keyframe captured long ago attends from an in-distribution recent offset.
@@ -263,13 +279,10 @@ class LayerKVCache(nn.Module):
                 dx_norm = 2.0 * dyaw / float(width)
             lo = self.pin_start + slot * self.tpf
             hi = lo + self.tpf
-            if do_spatial:
-                self.kv[0, :, :, lo:hi, :] = restamp_pose_k(
-                    self.kv[0, :, :, lo:hi, :], dx_norm, 0.0, dt,
-                    xy, inv_t, n_x, n_y)
-            else:
-                self.kv[0, :, :, lo:hi, :] = restamp_temporal_k(
-                    self.kv[0, :, :, lo:hi, :], dt, inv_t, n_spatial_pairs)
+            self.kv[0, :, :, lo:hi, :] = restamp_temporal_k(
+                self.kv[0, :, :, lo:hi, :], dt, inv_t, n_spatial_pairs,
+                dx_norm=dx_norm, dy_norm=0.0, xy=xy, n_x_pairs=n_x, n_y_pairs=n_y,
+            )
             self.pin_f[slot] = int(target_f)
             if do_spatial:
                 self.pin_yaw[slot] = float(target_yaw)

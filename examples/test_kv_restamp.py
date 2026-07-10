@@ -143,6 +143,110 @@ def test_reset_clears_pin_timeline():
     assert int(layer.pin_f[0]) == -1
 
 
+def test_restamp_temporal_pose_equals_reposition():
+    """Full (x,y,t) pose restamp through the unified restamp_temporal_k with spatial
+    xy supplied: restamp(k@pos1, dt, xy=..., dx_norm=...) == rope@pos2 for the
+    same raw key, where pos2 = pos1 + (dx,dt)."""
+    D = 128
+    N_XY = D // 8          # 16
+    N_X, N_Y, N_T = N_XY, N_XY, D // 4
+    HALF = D // 2
+    assert N_X + N_Y + N_T == HALF
+
+    H, W = 16, 32
+    NYQ = 1.0
+    max_freq = min(H, W) * NYQ
+    n = (N_XY + 1) // 2
+    XY = (torch.linspace(1.0, max_freq / 2, n) * torch.pi).repeat_interleave(2)[:N_XY]
+    THETA = 10000.0
+    INV_T = 1.0 / (THETA ** (torch.arange(0, N_T, 2, dtype=torch.float32) / N_T))
+    INV_T = INV_T.repeat_interleave(2)
+
+    def angle_at(x_norm, y_norm, t):
+        return torch.cat([x_norm * XY, y_norm * XY, t * INV_T])
+
+    def rope_apply(x, freqs):
+        cos, sin = freqs.cos(), freqs.sin()
+        x0, x1 = x.float().unfold(-1, 2, 2).unbind(-1)
+        y0 = x0 * cos - x1 * sin
+        y1 = x1 * cos + x0 * sin
+        return torch.cat((y0, y1), dim=-1).to(x.dtype)
+
+    raw = torch.randn(5, D)
+    x1, y1, t1 = -0.5, -0.3, 50
+    dyaw = 0.8
+    dt = 30
+    dx_norm = 2.0 * dyaw / W
+    x2, y2, t2 = x1 + dx_norm, y1, t1 + dt
+
+    k1 = rope_apply(raw, angle_at(x1, y1, t1))
+    k2 = rope_apply(raw, angle_at(x2, y2, t2))
+    k_restamped = kv.restamp_temporal_k(
+        k1, dt, INV_T, N_X + N_Y,
+        dx_norm=dx_norm, dy_norm=0.0, xy=XY, n_x_pairs=N_X, n_y_pairs=N_Y,
+    )
+    err = (k_restamped - k2).abs().max().item()
+    assert err < 1e-4, err
+
+
+def test_restamp_temporal_pose_leaves_y_pairs_untouched():
+    """When dy_norm=0, the y freq-pairs must be unchanged (unified signature)."""
+    D = 128
+    N_XY = D // 8
+    N_X, N_Y, N_T = N_XY, N_XY, D // 4
+    HALF = D // 2
+    H, W = 16, 32
+    max_freq = min(H, W) * 1.0
+    n = (N_XY + 1) // 2
+    XY = (torch.linspace(1.0, max_freq / 2, n) * torch.pi).repeat_interleave(2)[:N_XY]
+    INV_T = 1.0 / (10000.0 ** (torch.arange(0, N_T, 2, dtype=torch.float32) / N_T)).repeat_interleave(2)
+
+    k = torch.randn(5, D)
+    out = kv.restamp_temporal_k(
+        k, 10, INV_T, N_X + N_Y,
+        dx_norm=0.3, dy_norm=0.0, xy=XY, n_x_pairs=N_X, n_y_pairs=N_Y,
+    )
+    assert torch.allclose(out[..., N_X:N_X+N_Y], k[..., N_X:N_X+N_Y], atol=1e-6)
+    assert torch.allclose(out[..., HALF+N_X:HALF+N_X+N_Y], k[..., HALF+N_X:HALF+N_X+N_Y], atol=1e-6)
+    assert not torch.allclose(out[..., :N_X], k[..., :N_X], atol=1e-3)
+
+
+def test_restamp_pose_wrapper_equals_reposition():
+    """restamp_pose_k (thin wrapper over unified restamp_temporal_k) preserves the
+    original behavior: restamp(rope@pos1, dyaw, dt) == rope@pos2."""
+    D = 128
+    N_XY = D // 8
+    N_X, N_Y, N_T = N_XY, N_XY, D // 4
+    H, W = 16, 32
+    max_freq = min(H, W) * 1.0
+    n = (N_XY + 1) // 2
+    XY = (torch.linspace(1.0, max_freq / 2, n) * torch.pi).repeat_interleave(2)[:N_XY]
+    INV_T = 1.0 / (10000.0 ** (torch.arange(0, N_T, 2, dtype=torch.float32) / N_T)).repeat_interleave(2)
+
+    def angle_at(x_norm, y_norm, t):
+        return torch.cat([x_norm * XY, y_norm * XY, t * INV_T])
+
+    def rope_apply(x, freqs):
+        cos, sin = freqs.cos(), freqs.sin()
+        x0, x1 = x.float().unfold(-1, 2, 2).unbind(-1)
+        y0 = x0 * cos - x1 * sin
+        y1 = x1 * cos + x0 * sin
+        return torch.cat((y0, y1), dim=-1).to(x.dtype)
+
+    raw = torch.randn(5, D)
+    x1, y1, t1 = -0.5, -0.3, 50
+    dyaw = 0.8
+    dt = 30
+    dx_norm = 2.0 * dyaw / W
+    x2, y2, t2 = x1 + dx_norm, y1, t1 + dt
+
+    k1 = rope_apply(raw, angle_at(x1, y1, t1))
+    k2 = rope_apply(raw, angle_at(x2, y2, t2))
+    k_restamped = kv.restamp_pose_k(k1, dx_norm, 0.0, dt, XY, INV_T, N_X, N_Y)
+    err = (k_restamped - k2).abs().max().item()
+    assert err < 1e-4, err
+
+
 def test_restamp_pose_equals_reposition():
     """Full (x,y,t) pose restamp: restamp(rope@pos1, dyaw, dt) == rope@pos2 for the
     same raw key, where pos2 = pos1 shifted by the camera yaw delta and time delta."""
