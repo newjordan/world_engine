@@ -64,6 +64,15 @@ class AnchorStore:
         pick = min if mode == "nearest" else max
         return pick(self.keyframes, key=lambda k: abs(k.yaw - yaw))
 
+    def query_k(self, yaw: float, k: int = 8, mode: str = "min") -> List[AnchorKeyframe]:
+        """Up to k keyframes ranked by yaw distance. mode="min" nearest first,
+        mode="max" farthest first. Returns the whole store when k exceeds it."""
+        if not self.keyframes:
+            return []
+        ordered = sorted(self.keyframes, key=lambda kf: abs(kf.yaw - yaw),
+                         reverse=(mode == "max"))
+        return ordered[:max(1, k)]
+
 
 def micro_yaw_grid(yaw: float, yaw_delta: float, n: int = 4) -> np.ndarray:
     """Estimated per-frame yaws for a decoded chunk ending at `yaw`.
@@ -258,6 +267,192 @@ def reconstruct_temporal_batch(store: AnchorStore, current_x4: np.ndarray,
         out.append(recon)
         infos.append(info)
     return np.stack(out, axis=0).astype(np.uint8, copy=False), infos
+
+
+def calibrate_px_per_yaw(store: AnchorStore, resp_min: float = 0.05,
+                         max_shift_frac: float = 0.35) -> tuple[Optional[float], int]:
+    """Self-calibrated content scale: px of horizontal shift per command-yaw
+    unit, from registering adjacent-by-yaw keyframe ROIs at known yaw
+    separation. Returns (median dx/dyaw over pairs passing the resp/shift
+    gates, n_pairs); (None, 0) when no pair is registerable. Logged diagnostic
+    only since Phase 10g.2 — it does not gate acceptance.
+    """
+    kfs = sorted(store.keyframes, key=lambda kf: kf.yaw)
+    ratios = []
+    for a, b in zip(kfs, kfs[1:]):
+        dyaw = a.yaw - b.yaw
+        if dyaw == 0.0:
+            continue
+        dx, resp = register(a.roi, b.roi)
+        if resp < resp_min or abs(dx) > max_shift_frac * a.frames.shape[2]:
+            continue
+        ratios.append(dx / dyaw)
+    if not ratios:
+        return None, 0
+    return float(np.median(ratios)), len(ratios)
+
+
+def pose_plausible(dx: float, px_per_yaw: float, yaw_offset: float,
+                   bound: float = 1.5) -> bool:
+    """Pose-plausibility residual check. Refuted as a gate in Phase 10g.2 (the
+    residual cannot separate content drift from wrong-pose aliasing); kept as a
+    logged diagnostic only."""
+    return abs(dx / px_per_yaw - yaw_offset) <= bound
+
+
+def pose_window(store: AnchorStore, window_units: float = 3.0,
+                spacing_mult: float = 2.5) -> float:
+    """Pose-prior candidate window (Phase 10g.2): max of a fixed floor and a
+    spacing-aware term so the pool spans several keyframes at any protocol."""
+    yaws = sorted(kf.yaw for kf in store.keyframes)
+    gaps = [b - a for a, b in zip(yaws, yaws[1:])]
+    spacing = float(np.median(gaps)) if gaps else 0.0
+    return max(float(window_units), spacing_mult * spacing)
+
+
+def reacquire(store: AnchorStore, cur_roi: np.ndarray, yaw: float, k: int = 8,
+              mode: str = "min", resp_min: float = 0.05,
+              max_shift_frac: float = 0.35,
+              frame_w: Optional[float] = None,
+              window_units: float = 3.0,
+              spacing_mult: float = 2.5) -> dict:
+    """Content-defined loop-closure re-acquisition (Phase 10g, amended 10g.2).
+
+    Candidates from query_k are first restricted to a pose-prior window
+    (|kf.yaw - yaw| <= pose_window(store)), then the current ROI is registered
+    against each survivor and the highest-response match passing the resp/shift
+    gates wins. px_per_yaw and the winner's plausibility residual are logged
+    diagnostics only. reject="empty" when the store is empty, reject="nomatch"
+    when the pool is empty or nothing passes the gates — fail closed.
+    """
+    candidates = store.query_k(yaw, k=k, mode=mode)
+    result = {"winner": None, "winner_dx": None, "winner_resp": None,
+              "runner_up_resp": None, "n_candidates": len(candidates),
+              "n_windowed_out": 0, "window": None, "px_per_yaw": None,
+              "calib_pairs": 0, "plaus_residual": None, "reject": None}
+    if not candidates:
+        result["reject"] = "empty"
+        return result
+    window = pose_window(store, window_units, spacing_mult)
+    pooled = [kf for kf in candidates if abs(kf.yaw - yaw) <= window]
+    result.update(window=window, n_windowed_out=len(candidates) - len(pooled))
+    px_per_yaw, n_pairs = calibrate_px_per_yaw(store, resp_min=resp_min,
+                                               max_shift_frac=max_shift_frac)
+    result.update(px_per_yaw=px_per_yaw, calib_pairs=n_pairs)
+    if not pooled:
+        result["reject"] = "nomatch"
+        return result
+    if frame_w is None:
+        # roi_of crops columns to ~0.70 of the frame width (0.15..0.85).
+        frame_w = cur_roi.shape[1] / 0.70
+    scored = [(resp, dx, kf) for kf, (dx, resp)
+              in ((kf, register(kf.roi, cur_roi)) for kf in pooled)]
+    scored.sort(key=lambda t: t[0], reverse=True)
+    result["runner_up_resp"] = float(scored[1][0]) if len(scored) > 1 else None
+    for resp, dx, kf in scored:
+        if resp < resp_min or abs(dx) > max_shift_frac * frame_w:
+            continue
+        if px_per_yaw:
+            result["plaus_residual"] = abs(dx / px_per_yaw - (kf.yaw - yaw))
+        result.update(winner=kf, winner_dx=float(dx), winner_resp=float(resp))
+        return result
+    best_resp, best_dx, _ = scored[0]
+    result.update(winner_dx=float(best_dx), winner_resp=float(best_resp),
+                  reject="nomatch")
+    return result
+
+
+def reconstruct_temporal_from_keyframe(kf: AnchorKeyframe, current_x4: np.ndarray,
+                                       target_yaws: Sequence[float],
+                                       blend: bool = False,
+                                       resp_min: float = 0.05,
+                                       resp_full: float = 0.55,
+                                       max_shift_frac: float = 0.35,
+                                       feather: int = 8, mask_mode: str = "band",
+                                       conf_floor: float = 0.28) -> tuple[np.ndarray, list[dict]]:
+    """Temporal batch reconstruction forced against a single keyframe.
+
+    Used by re-acquisition arms: the content-winning keyframe (not per-micro yaw
+    retrieval) is the source, and target_yaws are the winner's stored micro_yaws.
+    """
+    if len(current_x4) != len(target_yaws):
+        raise ValueError("target_yaws length must match current_x4 length")
+    out, infos = [], []
+    for i, (cur, target_yaw) in enumerate(zip(current_x4, target_yaws)):
+        src_idx = nearest_micro_index(kf, float(target_yaw))
+        src = kf.frames[src_idx]
+        src_roi = kf.roi
+        if src_idx != len(kf.frames) - 1:
+            src_roi = roi_of(np.float32(cv2.cvtColor(src, cv2.COLOR_RGB2GRAY)))
+        src_yaw = None if kf.micro_yaws is None else float(kf.micro_yaws[src_idx])
+        recon, info = reconstruct_from_source(
+            src, src_roi, cur,
+            source_yaw=src_yaw if src_yaw is not None else kf.yaw,
+            resp_min=resp_min,
+            max_shift_frac=max_shift_frac,
+            feather=feather,
+            mask_mode=mask_mode,
+            conf_floor=conf_floor,
+        )
+        alpha = 1.0 if info["projected"] else 0.0
+        if blend and info["projected"]:
+            alpha = confidence_alpha(info.get("resp"), resp_min, resp_full)
+            recon = blend_u8(recon, cur, alpha)
+        info.update({
+            "anchor": bool(info["projected"]),
+            "alpha": alpha,
+            "target_yaw": float(target_yaw),
+            "micro_idx": i,
+            "kf_seq": kf.seq,
+            "kf_frame_idx": src_idx,
+            "kf_frame_yaw": src_yaw,
+        })
+        out.append(recon)
+        infos.append(info)
+    return np.stack(out, axis=0).astype(np.uint8, copy=False), infos
+
+
+def reacq_reconstruct(store: AnchorStore, current_x4: np.ndarray, yaw: float,
+                      k: int = 8, mode: str = "min", resp_min: float = 0.05,
+                      resp_full: float = 0.55, max_shift_frac: float = 0.35,
+                      feather: int = 8, mask_mode: str = "full",
+                      conf_floor: float = 0.28, blend: bool = False):
+    """Re-acquire the content-best keyframe and reconstruct the chunk against it.
+
+    Returns (recon_x4_or_None, micro_infos, diag). recon is None when the search
+    finds no admissible keyframe (diag["reject"] in {"empty", "nomatch"}); pose is
+    reset to the winner's stored micro_yaws before reconstruction.
+    """
+    cur_roi = roi_of(np.float32(cv2.cvtColor(current_x4[-1], cv2.COLOR_RGB2GRAY)))
+    res = reacquire(store, cur_roi, yaw, k=k, mode=mode, resp_min=resp_min,
+                    max_shift_frac=max_shift_frac, frame_w=current_x4.shape[2])
+    win = res["winner"]
+    diag = {
+        "n_candidates": res["n_candidates"],
+        "winner_seq": None if win is None else int(win.seq),
+        "winner_yaw": None if win is None else float(win.yaw),
+        "drift": None if win is None else float(win.yaw - yaw),
+        "winner_dx": res["winner_dx"],
+        "winner_resp": res["winner_resp"],
+        "runner_up_resp": res["runner_up_resp"],
+        "window": res["window"],
+        "n_windowed_out": res["n_windowed_out"],
+        "px_per_yaw": res["px_per_yaw"],
+        "calib_pairs": res["calib_pairs"],
+        "plaus_residual": res["plaus_residual"],
+        "reject": res["reject"],
+    }
+    if win is None:
+        return None, [], diag
+    if win.micro_yaws is not None and len(win.micro_yaws) == len(current_x4):
+        target_yaws = win.micro_yaws
+    else:
+        target_yaws = [float(win.yaw)] * len(current_x4)
+    recon_x4, micro_infos = reconstruct_temporal_from_keyframe(
+        win, current_x4, target_yaws, blend=blend, resp_min=resp_min,
+        resp_full=resp_full, max_shift_frac=max_shift_frac, feather=feather,
+        mask_mode=mask_mode, conf_floor=conf_floor)
+    return recon_x4, micro_infos, diag
 
 
 def repeat_as_x4(img: np.ndarray) -> np.ndarray:

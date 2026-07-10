@@ -21,8 +21,8 @@ import numpy as np
 import torch
 
 from anchor import (AnchorStore, blend_u8, confidence_alpha, micro_yaw_grid,
-                    reconstruct_from_keyframe, reconstruct_temporal_batch,
-                    repeat_as_x4)
+                    reacq_reconstruct, reconstruct_from_keyframe,
+                    reconstruct_temporal_batch, repeat_as_x4)
 from atlas import AtlasStore, _clear_pins
 from permanence_bench import RealEngine, _noop, load_seeds, psnr, ssim
 from rigid import RigidStore, band_mask, rigid_step
@@ -39,6 +39,7 @@ ANCHOR_ARMS = {
     "anchor4_full_resp25_far", "anchor4_full_dx96_resp25_far",
     "anchor4_full_pose02", "anchor4_full_pose04",
     "anchor4_full_pose02_far", "anchor4_full_pose04_far",
+    "anchor4_full_reacq_pose02", "anchor4_full_reacq_pose02_far",
 }
 ATLAS_ARMS = {"atlas_nowb"}
 
@@ -78,6 +79,14 @@ def _retrieve_mode(arm):
     return "farthest" if arm.endswith("_far") else "nearest"
 
 
+def _is_reacq(arm):
+    return "reacq" in arm
+
+
+def _reacq_pool(arm):
+    return "max" if arm.endswith("_far") else "min"
+
+
 def _mask_mode(arm):
     if arm.startswith("anchor_full") or arm.startswith("anchor4_full"):
         return "full"
@@ -88,18 +97,25 @@ def _mask_mode(arm):
 
 def _admission_failure(arm, micro_infos):
     has_pose = any(tok in arm for tok in ("pose02", "pose04"))
-    has_gate = has_pose or any(tok in arm for tok in ("dx64", "dx96", "dx128", "resp25"))
+    has_reacq = "reacq" in arm
+    has_gate = has_pose or has_reacq or any(tok in arm for tok in ("dx64", "dx96", "dx128", "resp25"))
     if not arm.startswith("anchor4_full_") or not has_gate:
         return None
     projected = [i for i in micro_infos if i.get("projected")]
     if not projected:
         return None
-    if not has_pose and len(projected) != len(micro_infos):
+    if not has_pose and not has_reacq and len(projected) != len(micro_infos):
         return "admit_partial"
     dx_abs = [abs(i["dx_px"]) for i in projected if i.get("dx_px") is not None]
     resp = [i["resp"] for i in projected if i.get("resp") is not None]
     dx_mean = float(np.mean(dx_abs)) if dx_abs else float("inf")
     resp_mean = float(np.mean(resp)) if resp else 0.0
+    if has_reacq:
+        dx_vals = [i["dx_px"] for i in projected if i.get("dx_px") is not None]
+        if dx_vals:
+            med = float(np.median(dx_vals))
+            if max(abs(d - med) for d in dx_vals) > 24.0:
+                return "admit_consist"
     if has_pose:
         pose_errs = []
         for i in projected:
@@ -153,8 +169,59 @@ def _info_stats(infos):
     }
 
 
+def _fmtn(x):
+    return "-" if x is None else f"{x:.3f}"
+
+
+def _append_reacq(eng, store, current_rgb, arm, args, anchor_count, current_x4):
+    if current_x4 is None:
+        current_x4 = repeat_as_x4(current_rgb)
+    yaw = float(eng.engine.camera_yaw)
+    recon_x4, micro_infos, diag = reacq_reconstruct(
+        store, current_x4, yaw,
+        k=args.reacq_k, mode=_reacq_pool(arm),
+        resp_min=args.resp_min, resp_full=args.resp_full,
+        max_shift_frac=args.max_shift_frac, feather=args.pixel_feather,
+        mask_mode=_mask_mode(arm))
+    if recon_x4 is None:
+        out = current_rgb
+        info = {"projected": False, "dx_px": None, "resp": None,
+                "reject": diag["reject"], "anchor": False, "alpha": 0.0,
+                "anchor_count": anchor_count}
+    else:
+        admit_failure = _admission_failure(arm, micro_infos)
+        if not any(i.get("projected") for i in micro_infos) or admit_failure:
+            out = current_rgb
+            info = _summarize_micro_infos(micro_infos, anchor_count)
+            if admit_failure:
+                info.update(projected=False, reject=admit_failure)
+            elif not info["projected"]:
+                info.update(reject="nomatch")
+            high_level = dict(info)
+            high_level.pop("micro_infos", None)
+            info.update(anchor=False, micro_infos=[high_level])
+        else:
+            ctrl = eng._CtrlInput(button=set(), mouse=(0.0, 0.0))
+            four = eng.engine.append_frame(torch.from_numpy(recon_x4).to(eng.device), ctrl=ctrl)
+            out = eng.last_rgb(four)
+            anchor_count += 1
+            info = _summarize_micro_infos(micro_infos, anchor_count)
+            info.update(anchor=True)
+    print(f"    reacq {arm}: cand={diag['n_candidates']} window={_fmtn(diag['window'])} "
+          f"n_win_out={diag['n_windowed_out']} win_seq={diag['winner_seq']} "
+          f"drift={_fmtn(diag['drift'])} win_resp={_fmtn(diag['winner_resp'])} "
+          f"run2={_fmtn(diag['runner_up_resp'])} win_dx={_fmtn(diag['winner_dx'])} "
+          f"ppy={_fmtn(diag['px_per_yaw'])} resid={_fmtn(diag['plaus_residual'])} "
+          f"-> {'anchor' if info.get('anchor') else (info.get('reject') or 'reject')}",
+          flush=True)
+    return out, info
+
+
 def _append_anchor(eng, store, current_rgb, arm, args, anchor_count,
                    current_x4=None, target_yaws=None):
+    if _is_reacq(arm):
+        return _append_reacq(eng, store, current_rgb, arm, args, anchor_count,
+                             current_x4)
     kf = store.query(float(eng.engine.camera_yaw), mode=_retrieve_mode(arm))
     info = {"projected": False, "dx_px": None, "resp": None, "reject": "empty",
             "anchor": False, "alpha": 0.0, "anchor_count": anchor_count}
@@ -399,6 +466,7 @@ def main():
     ap.add_argument("--resp-min", type=float, default=0.05)
     ap.add_argument("--resp-full", type=float, default=0.55)
     ap.add_argument("--max-shift-frac", type=float, default=0.35)
+    ap.add_argument("--reacq-k", type=int, default=8, help="reacq candidate pool size")
     ap.add_argument("--restamp-offset", type=int, default=4)
     ap.add_argument("--atlas-k", type=int, default=1)
     ap.add_argument("--arms", default="revisit,atlas_nowb,anchor,anchor_blend")

@@ -25,10 +25,10 @@ import numpy as np
 import torch
 
 from anchor import (AnchorStore, blend_u8, confidence_alpha, micro_yaw_grid,
-                    reconstruct_from_keyframe, reconstruct_temporal_batch,
-                    repeat_as_x4)
-from anchor_probe import (ANCHOR_ARMS, _admission_failure, _mask_mode,
-                          _retrieve_mode, _summarize_micro_infos)
+                    reacq_reconstruct, reconstruct_from_keyframe,
+                    reconstruct_temporal_batch, repeat_as_x4)
+from anchor_probe import (ANCHOR_ARMS, _admission_failure, _is_reacq, _mask_mode,
+                          _reacq_pool, _retrieve_mode, _summarize_micro_infos)
 from atlas import AtlasStore, _clear_pins
 from permanence_bench import RealEngine, _noop, load_seeds, psnr
 from rigid import RigidStore, band_mask, rigid_step
@@ -55,6 +55,33 @@ def pc_shift(prev, gray):
 
 
 def _append_anchor_x4(eng, store, current_rgb, arm, args, current_x4, target_yaws):
+    if _is_reacq(arm):
+        yaw = float(eng.engine.camera_yaw)
+        recon_x4, micro_infos, diag = reacq_reconstruct(
+            store, current_x4, yaw,
+            k=args.reacq_k, mode=_reacq_pool(arm),
+            resp_min=args.resp_min, resp_full=args.resp_full,
+            max_shift_frac=args.max_shift_frac, feather=args.pixel_feather,
+            mask_mode=_mask_mode(arm))
+        diag_fields = {k: v for k, v in diag.items() if k != "reject"}
+        if recon_x4 is None:
+            return None, {"projected": False, "anchor": False,
+                          "reject": diag["reject"], **diag_fields}
+        admit_failure = _admission_failure(arm, micro_infos)
+        if not any(i.get("projected") for i in micro_infos) or admit_failure:
+            info = _summarize_micro_infos(micro_infos, 0)
+            if admit_failure:
+                info.update(projected=False, reject=admit_failure)
+            elif not info["projected"]:
+                info.update(reject="nomatch")
+            info.update(anchor=False, **diag_fields)
+            return None, info
+        ctrl = eng._CtrlInput(button=set(), mouse=(0.0, 0.0))
+        four = eng.engine.append_frame(torch.from_numpy(recon_x4).to(eng.device), ctrl=ctrl)
+        info = _summarize_micro_infos(micro_infos, 1)
+        info.update(anchor=True, **diag_fields)
+        return eng.all_rgb(four), info
+
     kf = store.query(float(eng.engine.camera_yaw), mode=_retrieve_mode(arm))
     if kf is None:
         return None, {"projected": False, "anchor": False, "reject": "empty"}
@@ -367,6 +394,7 @@ def main():
     ap.add_argument("--resp-min", type=float, default=0.05)
     ap.add_argument("--resp-full", type=float, default=0.55)
     ap.add_argument("--max-shift-frac", type=float, default=0.35)
+    ap.add_argument("--reacq-k", type=int, default=8, help="reacq candidate pool size")
     ap.add_argument("--restamp-offset", type=int, default=4)
     ap.add_argument("--atlas-k", type=int, default=1)
     ap.add_argument("--quant", default=None)
